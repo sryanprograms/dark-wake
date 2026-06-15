@@ -1,1219 +1,456 @@
-# PolarWatch Phase 0–1 (Foundation) Implementation Plan
+# DarkWake Phase 0–1 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Spec:** `docs/superpowers/specs/darkwake-design.md` (v4) is the source of truth. This plan covers **Phase 0 (Overlap spike)** and **Phase 1 (Visualization)** only. Do not start Phase 2 (gap detection / prediction) until both phases here meet their definition of done.
 
-**Goal:** Stand up the PolarWatch repo and a working data pipeline that ingests Barents-Sea AIS, builds per-vessel tracks, and replays a full day through a clock-driven engine — so "a Barents Sea day replays through the pipeline" is demonstrably true and one command boots the stack.
+**Goal:** Prove AIS-and-SAR temporal overlap for a chosen AOI (Phase 0), then stand up a replayable AIS visualization over that AOI on a map (Phase 1). No fusion, no dark-contact matching, no behavioral rules yet.
 
-**Architecture:** A small Python package (`src/polarwatch`) with focused modules: a typed entity model (`AisPosition`, `VesselTrack`), pure normalization from raw AIS records, Parquet I/O, a deterministic synthetic-day generator (the reproducible test/demo fixture), a live BarentsWatch capture client (real OAuth2 + REST, network-isolated and mockable), a track builder, and a clock-driven replay engine with an injectable sleep for instant tests. A Typer CLI wires the stages (`synth-day → ingest → replay`, plus `capture` and `demo`). Docker Compose boots the app plus Redis and PostGIS placeholders (pre-wired for Phase 2's entity store).
+**Architecture:** Monorepo per spec §12 — `backend/app/` (FastAPI + PostGIS ingest/replay/API), `frontend/` (React + Vite + deck.gl + MapLibre), and `scripts/` (overlap spike + data pulls). PostgreSQL/PostGIS is the store from day one; geometry in WGS84 (EPSG:4326), distance in `geography`/metric CRS — never degrees. The AOI bbox and all thresholds live in config modules, not inline.
 
-**Tech Stack:** Python 3.11+, pydantic v2 (typed models + validation), pandas + pyarrow (Parquet), httpx (HTTP, mocked via `httpx.MockTransport`), Typer (CLI), pytest. Docker Compose for the stack. `geopandas`/GeoParquet are intentionally deferred to a later phase (spatial ops aren't needed yet; avoids GDAL weight) — plain Parquet with lat/lon columns suffices for Phase 0–1.
+**Tech stack:** Python 3.11+, FastAPI + uvicorn, asyncpg or SQLAlchemy 2.x, GeoPandas + Shapely, httpx/websockets (AIS + GFW), pytest. Frontend: React + Vite + TypeScript, deck.gl over MapLibre GL JS. Docker Compose: PostGIS + backend (+ frontend dev server or static build).
 
 **Key design decisions (locked):**
-- **Raw record shape is BarentsWatch-like** so the synthetic generator and the live client produce the *same* shape, and one `normalize_record` handles both: `{mmsi, latitude, longitude, speedOverGround, courseOverGround, trueHeading, name, msgtime}`.
-- **Replay is testable** via an injected `sleep` callable — tests record sleep durations instead of waiting.
-- **Network is isolated** — the BarentsWatch client takes an `httpx.Client`, so tests use `httpx.MockTransport` with zero real calls.
-- **Data files are runtime artifacts** — everything under `data/` is gitignored.
+
+- **AOI is config, not code.** Default demo AOI: Gulf of Finland cable corridor (`config/aoi.py`), roughly 59.3–60.3°N, 23.5–27.0°E. Hormuz is an alternate; do not hard-code either outside config.
+- **Phase 0 is the gate.** If AIS and SAR do not overlap spatially and temporally for the chosen bbox/window, change the date or bbox before building Phase 1.
+- **AIS source follows the overlap path.** Historical replay: Danish Maritime Authority daily CSV (western Baltic, guaranteed history) or Fintraffic for Gulf of Finland. Flexible live path: AISStream.io WebSocket (record a window to DB). Pick whichever gives overlap with GFW SAR for the chosen window.
+- **SAR source is GFW REST** (`ingest/sar_gfw.py` / `scripts/pull_sar.py`). Pull detections yourself; do not use GFW's precomputed matched/unmatched flag.
+- **Phase 1 scope is AIS-only on the map.** SAR layer, connector lines, dark contacts, and behavioral flags are Phase 3+.
+- **No ML, no custom SAR detector, no spoofing detection** in Phase 0–1 (spec §3 non-goals).
+- **Runtime data is gitignored** — everything under `data/` and recorded AIS captures.
+
+**Note on existing scaffold:** The repo currently has a `src/polarwatch/` package skeleton from an earlier PolarWatch plan. Replace/restructure toward the DarkWake layout in Task 1; do not extend the old BarentsWatch/Parquet pipeline.
 
 ---
 
-## File Structure
+## File structure (target after Phase 0–1)
 
 | File | Responsibility |
 |---|---|
-| `pyproject.toml` | Package metadata, deps, `polarwatch` console script, pytest/setuptools config |
-| `.gitignore` | Ignore `data/`, `.env`, caches, venvs |
-| `.env.example` | Document `BARENTSWATCH_CLIENT_ID` / `_SECRET` |
-| `README.md` | Project intro, quickstart, architecture note |
-| `Dockerfile` | Build the app image; default CMD runs the demo |
-| `docker-compose.yml` | App + Redis + PostGIS (Phase 2 placeholders) |
-| `src/polarwatch/__init__.py` | Package marker / version |
-| `src/polarwatch/model.py` | `AisPosition`, `VesselTrack` typed models |
-| `src/polarwatch/normalize.py` | `normalize_record(raw) -> AisPosition` (pure) |
-| `src/polarwatch/parquet_io.py` | positions ⇄ Parquet; NDJSON read |
-| `src/polarwatch/synth.py` | Deterministic synthetic Barents-Sea day generator |
-| `src/polarwatch/barentswatch.py` | Live AIS capture: OAuth2 token + fetch positions |
-| `src/polarwatch/tracks.py` | `build_tracks(positions) -> list[VesselTrack]` |
-| `src/polarwatch/replay.py` | Clock-driven `replay(positions, speed, sleep)` generator |
-| `src/polarwatch/cli.py` | Typer app: `synth-day`, `ingest`, `replay`, `capture`, `demo` |
-| `tests/test_*.py` | One test module per source module + end-to-end |
+| `docker-compose.yml` | PostGIS + backend (+ optional frontend service) |
+| `README.md` | Project intro, Phase 0 gate instructions, Phase 1 quickstart |
+| `.env.example` | `DATABASE_URL`, `GFW_API_TOKEN`, `AISSTREAM_API_KEY`, optional Fintraffic keys |
+| `backend/pyproject.toml` | Backend deps, console scripts |
+| `backend/app/main.py` | FastAPI app entry |
+| `backend/app/config/aoi.py` | Bounding box + scenario metadata |
+| `backend/app/config/settings.py` | Env-backed settings |
+| `backend/app/config/thresholds.py` | Tunable defaults (stub in Phase 0–1; used from Phase 2+) |
+| `backend/app/db/models.py` | SQLAlchemy/async models matching spec §7 (Phase 1: `vessel`, `ais_position`) |
+| `backend/app/db/migrations/` | Initial schema migration |
+| `backend/app/ingest/ais_csv.py` | Load DMA (or similar) CSV → PostGIS |
+| `backend/app/ingest/ais_stream.py` | AISStream WebSocket recorder (optional path) |
+| `backend/app/ingest/sar_gfw.py` | GFW SAR detection fetch (Phase 0 spike + later fusion) |
+| `backend/app/replay/clock.py` | Replay clock with injectable time source (testable) |
+| `backend/app/replay/streamer.py` | Push `ais` events over WebSocket during replay |
+| `backend/app/api/ws.py` | `/ws/replay` — play/pause/seek/speed |
+| `backend/app/api/rest.py` | `GET /scenarios`, `GET /vessels/{mmsi}/track` (Phase 1 minimum) |
+| `frontend/` | Vite + React + deck.gl map + replay controls |
+| `scripts/spike_overlap.py` | Phase 0 gate: confirm AIS + SAR overlap for AOI/window |
+| `scripts/pull_sar.py` | Pull GFW SAR detections for AOI/date to `data/` |
+| `backend/tests/` | pytest modules per component |
 
 ---
 
-## Task 1: Repo scaffolding & package skeleton
+## Phase 0 — Overlap spike (the gate)
+
+**Done when:** For one chosen moment inside the AOI/window, you can show a set of AIS positions and a set of GFW SAR detections over the same water — spatially and temporally aligned. Document the chosen bbox, date range, AIS source, and SAR scene timestamp in the spike output.
+
+### Task 1: Repo restructure + config skeleton
 
 **Files:**
-- Create: `pyproject.toml`, `.gitignore`, `.env.example`, `src/polarwatch/__init__.py`, `tests/__init__.py`
+- Create/restructure: `backend/app/config/{aoi,settings,thresholds}.py`, update `.env.example`, `.gitignore`, `README.md` (skeleton)
+- Remove or archive: `src/polarwatch/` (superseded)
 
-- [ ] **Step 1: Create `.gitignore`**
+- [ ] **Step 1: Restructure toward spec §12 layout**
 
-```
-__pycache__/
-*.pyc
-.venv/
-venv/
-.env
-data/
-*.parquet
-*.ndjson
-.pytest_cache/
-*.egg-info/
-dist/
-build/
-```
+Create `backend/app/`, `frontend/`, `scripts/` directories. Move or replace the old `polarwatch` package; backend code lives under `backend/app/`.
 
-- [ ] **Step 2: Create `.env.example`**
-
-```
-# BarentsWatch open AIS API credentials (register a client at https://www.barentswatch.no)
-BARENTSWATCH_CLIENT_ID=
-BARENTSWATCH_CLIENT_SECRET=
-```
-
-- [ ] **Step 3: Create `pyproject.toml`**
-
-```toml
-[project]
-name = "polarwatch"
-version = "0.1.0"
-description = "Dark vessel detection for the polar & northern seas"
-requires-python = ">=3.11"
-dependencies = [
-    "pydantic>=2.6",
-    "pandas>=2.2",
-    "pyarrow>=15.0",
-    "httpx>=0.27",
-    "typer>=0.12",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=8.0"]
-
-[project.scripts]
-polarwatch = "polarwatch.cli:app"
-
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
-```
-
-- [ ] **Step 4: Create `src/polarwatch/__init__.py`**
+- [ ] **Step 2: Create `backend/app/config/aoi.py`**
 
 ```python
-__version__ = "0.1.0"
+# Gulf of Finland cable corridor (primary demo AOI)
+AOI_NAME = "gulf_of_finland"
+BBOX = {
+    "min_lat": 59.3,
+    "max_lat": 60.3,
+    "min_lon": 23.5,
+    "max_lon": 27.0,
+}
+# Default scenario window — adjust after spike if overlap fails
+DEFAULT_START = "2024-10-08T00:00:00Z"
+DEFAULT_END   = "2024-10-09T00:00:00Z"
 ```
 
-- [ ] **Step 5: Create empty `tests/__init__.py`**
+- [ ] **Step 3: Create `backend/app/config/settings.py`**
 
-```python
+Load from env: `DATABASE_URL`, `GFW_API_TOKEN`, `AISSTREAM_API_KEY`. Sensible defaults for local dev.
+
+- [ ] **Step 4: Create stub `backend/app/config/thresholds.py`**
+
+Copy fusion/behavior threshold constants from spec §8 and §9 as documented defaults. Not used in Phase 0–1 logic yet; prevents magic numbers later.
+
+- [ ] **Step 5: Update `.env.example`**
+
+```
+DATABASE_URL=postgresql://darkwake:darkwake@localhost:5432/darkwake
+GFW_API_TOKEN=
+AISSTREAM_API_KEY=
 ```
 
-- [ ] **Step 6: Create venv and install**
+- [ ] **Step 6: Update `.gitignore`**
 
-Run:
+Ensure `data/`, `.env`, `node_modules/`, `frontend/dist/`, Python caches, and venvs are ignored.
+
+- [ ] **Step 7: Commit**
+
 ```bash
-python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
+git add backend/app/config/ .env.example .gitignore README.md
+git commit -m "chore: restructure repo for DarkWake Phase 0 config"
 ```
-Expected: installs polarwatch and pytest with no errors.
 
-- [ ] **Step 7: Verify the package imports**
+---
 
-Run: `python -c "import polarwatch; print(polarwatch.__version__)"`
-Expected: prints `0.1.0`
+### Task 2: GFW SAR pull script
+
+**Files:**
+- Create: `backend/app/ingest/sar_gfw.py`, `scripts/pull_sar.py`
+- Test: `backend/tests/test_sar_gfw.py` (mock httpx; no live network in CI)
+
+- [ ] **Step 1: Write failing tests for GFW client**
+
+Test that `fetch_detections(bbox, start, end, client)` parses GFW REST JSON into `{t, lat, lon, length_m, scene_id, confidence}` records. Use `httpx.MockTransport`.
+
+- [ ] **Step 2: Implement `sar_gfw.py`**
+
+Call GFW vessel-detection REST API with bearer token. Filter to bbox. Return normalized detection dicts.
+
+- [ ] **Step 3: Implement `scripts/pull_sar.py`**
+
+CLI: read AOI + date window from config/env, call `fetch_detections`, write `data/sar_{aoi}_{date}.json` (or GeoJSON).
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest backend/tests/test_sar_gfw.py -v`
+Expected: all pass offline.
+
+- [ ] **Step 5: Manual pull (requires `GFW_API_TOKEN`)**
+
+Run: `python scripts/pull_sar.py --start 2024-10-08 --end 2024-10-09`
+Expected: non-empty detection file for the Gulf of Finland window (adjust dates if empty).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/app/ingest/sar_gfw.py scripts/pull_sar.py backend/tests/test_sar_gfw.py
+git commit -m "feat: add GFW SAR detection pull client"
+```
+
+---
+
+### Task 3: AIS sample pull (historical path)
+
+**Files:**
+- Create: `backend/app/ingest/ais_csv.py`, `scripts/pull_ais.py` (or equivalent)
+- Test: `backend/tests/test_ais_csv.py`
+
+For Phase 0, prefer **Danish Maritime Authority daily CSV** or **Fintraffic** — whichever covers the AOI with guaranteed historical data. DMA is western Baltic; confirm it reaches the Gulf of Finland bbox or switch to Fintraffic/AISStream recording.
+
+- [ ] **Step 1: Choose AIS source for the default AOI**
+
+Document the choice in `README.md`. If DMA CSV does not cover the bbox, use Fintraffic API or record an AISStream window.
+
+- [ ] **Step 2: Write failing tests for CSV normalization**
+
+Test that a sample DMA/Fintraffic row maps to `{mmsi, t, lat, lon, sog, cog, heading, name}`.
+
+- [ ] **Step 3: Implement `ais_csv.py`**
+
+Parse source CSV/API response, filter to AOI bbox and time window, return normalized position records.
+
+- [ ] **Step 4: Implement pull script**
+
+Write filtered positions to `data/ais_{aoi}_{date}.json` (or CSV).
+
+- [ ] **Step 5: Manual pull**
+
+Run pull for the same window as Task 2 SAR pull.
+Expected: non-empty AIS file with positions inside the bbox.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/app/ingest/ais_csv.py scripts/ backend/tests/test_ais_csv.py README.md
+git commit -m "feat: add AIS historical pull for overlap spike"
+```
+
+---
+
+### Task 4: Overlap spike script (Phase 0 done-criterion)
+
+**Files:**
+- Create: `scripts/spike_overlap.py`
+- Test: `backend/tests/test_spike_overlap.py`
+
+- [ ] **Step 1: Write failing tests**
+
+Synthetic fixtures: AIS positions spanning 08:00–20:00 UTC; SAR detections at 14:30 UTC inside bbox. Assert spike reports `overlap: true` and names the SAR scene time. Negative fixture: SAR scene outside AIS window → `overlap: false`.
+
+- [ ] **Step 2: Implement overlap logic**
+
+Load AIS + SAR files from `data/`. Check:
+1. At least one SAR detection centroid falls inside the AOI bbox.
+2. AIS coverage window brackets at least one SAR scene timestamp (± configurable margin, e.g. 1 h).
+3. At that timestamp, at least N AIS positions exist inside the bbox (configurable minimum).
+
+Print a human-readable report: bbox, AIS source, AIS time range, SAR scene times, counts, pass/fail.
+
+- [ ] **Step 3: Run against real pulled data**
+
+Run: `python scripts/spike_overlap.py --ais data/ais_*.json --sar data/sar_*.json`
+Expected: **PASS**. If fail, adjust date/bbox per spec §4 and re-pull before proceeding.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scripts/spike_overlap.py backend/tests/test_spike_overlap.py
+git commit -m "feat: add Phase 0 AIS-SAR overlap spike gate"
+```
+
+**Phase 0 checkpoint:** Do not start Phase 1 until the spike passes on real data for the chosen scenario.
+
+---
+
+## Phase 1 — Visualization (AIS on a map, replayable)
+
+**Done when:** `docker compose up` boots PostGIS + backend; loading the Phase 0 AIS window into the DB and opening the frontend lets you play/scrub the replay and watch real vessels move over the AOI. No SAR layer yet.
+
+### Task 5: Docker + PostGIS + schema
+
+**Files:**
+- Create: `docker-compose.yml`, `backend/Dockerfile`, `backend/app/db/models.py`, `backend/app/db/migrations/001_initial.sql`
+
+- [ ] **Step 1: Create `docker-compose.yml`**
+
+Services: `postgis` (PostGIS 16), `backend` (FastAPI, depends on postgis). No Redis (not in DarkWake spec). Expose 5432 and backend port (8000).
+
+- [ ] **Step 2: Create initial migration matching spec §7 (Phase 1 subset)**
+
+Tables: `vessel`, `ais_position` with `geom GEOMETRY(Point,4326)`, indexes on `(mmsi, t)` and GIST on `geom`. Defer `sar_detection`, `contact`, `asset`, `behavior_event` to later phases (or create empty stubs if easier — they stay unused in Phase 1).
+
+- [ ] **Step 3: Wire SQLAlchemy/asyncpg models**
+
+`AisPosition` row ↔ spec columns. Helper to insert positions from normalized ingest records.
+
+- [ ] **Step 4: Verify stack boots**
+
+Run: `docker compose up --build`
+Expected: PostGIS healthy, backend starts, migration applied.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docker-compose.yml backend/Dockerfile backend/app/db/
+git commit -m "feat: add PostGIS stack and AIS schema"
+```
+
+---
+
+### Task 6: AIS loader → database
+
+**Files:**
+- Extend: `backend/app/ingest/ais_csv.py` (or add `loader.py`)
+- Create: CLI command or script `scripts/load_ais.py`
+- Test: `backend/tests/test_ais_loader.py` (use test DB or transactional fixture)
+
+- [ ] **Step 1: Write failing tests**
+
+Load a small fixture CSV/JSON into DB; query back count and sample geometry; assert WGS84 point stored correctly.
+
+- [ ] **Step 2: Implement loader**
+
+Bulk insert positions; upsert `vessel` rows from latest known name/type fields.
+
+- [ ] **Step 3: Load Phase 0 AIS data**
+
+Run loader against the file that passed the overlap spike.
+Expected: row count matches spike AIS count.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add backend/app/ingest/ backend/tests/test_ais_loader.py scripts/load_ais.py
+git commit -m "feat: load AIS positions into PostGIS"
+```
+
+---
+
+### Task 7: Replay clock + WebSocket streamer
+
+**Files:**
+- Create: `backend/app/replay/clock.py`, `backend/app/replay/streamer.py`, `backend/app/api/ws.py`
+- Test: `backend/tests/test_replay_clock.py`, `backend/tests/test_ws_replay.py`
+
+- [ ] **Step 1: Write failing tests for replay clock**
+
+Injectable clock; `seek(t)`, `play()`, `pause()`, `speed multiplier`. Emit ordered AIS events from DB for `[t, t+Δ]`. Tests run without real time delays.
+
+- [ ] **Step 2: Implement `clock.py`**
+
+Query `ais_position` rows in time order for the loaded scenario window.
+
+- [ ] **Step 3: Write failing WebSocket tests**
+
+Client sends `{action: "play"|"pause"|"seek", ...}`; server pushes `{type: "ais", mmsi, t, lat, lon, sog, cog, heading}` events. Use FastAPI `TestClient` + websockets test helper.
+
+- [ ] **Step 4: Implement `/ws/replay`**
+
+Wire clock to streamer; support play/pause/seek/speed per spec §10.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/app/replay/ backend/app/api/ws.py backend/tests/
+git commit -m "feat: add replay clock and AIS WebSocket stream"
+```
+
+---
+
+### Task 8: REST API (Phase 1 minimum)
+
+**Files:**
+- Create: `backend/app/api/rest.py`, `backend/app/main.py`
+- Test: `backend/tests/test_rest.py`
+
+- [ ] **Step 1: Implement endpoints**
+
+- `GET /scenarios` — list loaded scenario(s) with time range and bbox
+- `GET /vessels/{mmsi}/track?start=&end=` — positions for detail/highlight
+
+- [ ] **Step 2: Tests for REST**
+
+Assert JSON shapes and 404 for unknown MMSI.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add backend/app/api/rest.py backend/app/main.py backend/tests/test_rest.py
+git commit -m "feat: add Phase 1 REST endpoints"
+```
+
+---
+
+### Task 9: Frontend — map + replay controls
+
+**Files:**
+- Create: `frontend/` (Vite + React + TS), `frontend/src/map/`, `frontend/src/ws/`, `frontend/src/components/ReplayControls.tsx`
+
+- [ ] **Step 1: Scaffold frontend**
+
+`npm create vite@latest frontend -- --template react-ts`. Add deck.gl, `@deck.gl/layers`, `@deck.gl/mapbox`, `maplibre-gl`.
+
+- [ ] **Step 2: Dark basemap**
+
+MapLibre with CARTO dark / OpenFreeMap / Protomaps (no token lock-in).
+
+- [ ] **Step 3: AIS layer**
+
+`ScatterplotLayer` or `IconLayer` for vessels; oriented by heading; muted color per spec §11 (AIS-only phase — no SAR/dark styling yet).
+
+- [ ] **Step 4: WebSocket client**
+
+Connect to `/ws/replay`; update vessel positions on `ais` events; maintain latest position per MMSI.
+
+- [ ] **Step 5: Replay controls**
+
+Play, pause, speed, scrub bar bound to scenario time range. Send control messages to WebSocket.
+
+- [ ] **Step 6: Wire docker-compose frontend service (optional)**
+
+Either serve frontend via Vite dev server in compose, or build static assets and mount in backend.
+
+- [ ] **Step 7: Manual verification (Phase 1 done-criterion)**
+
+1. `docker compose up`
+2. Load AIS data for the Phase 0 scenario
+3. Open map UI, press play
+4. Observe vessels moving over the Gulf of Finland AOI
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add pyproject.toml .gitignore .env.example src/polarwatch/__init__.py tests/__init__.py
-git commit -m "chore: scaffold polarwatch package skeleton"
+git add frontend/
+git commit -m "feat: add AIS map visualization with replay controls"
 ```
 
 ---
 
-## Task 2: Typed entity model (`AisPosition`, `VesselTrack`)
+### Task 10: README + end-to-end documentation
 
 **Files:**
-- Create: `src/polarwatch/model.py`
-- Test: `tests/test_model.py`
+- Update: `README.md`
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Document Phase 0 gate**
 
-```python
-# tests/test_model.py
-from datetime import datetime, timezone
+How to set tokens, pull AIS + SAR, run `spike_overlap.py`, and what PASS means.
 
-import pytest
-from pydantic import ValidationError
-
-from polarwatch.model import AisPosition, VesselTrack
-
-
-def _pos(mmsi=257000001, t=0, lat=70.0, lon=20.0):
-    return AisPosition(
-        mmsi=mmsi,
-        timestamp=datetime(2026, 6, 1, 0, t, 0, tzinfo=timezone.utc),
-        lat=lat,
-        lon=lon,
-    )
-
-
-def test_position_minimal_fields_default_none():
-    p = _pos()
-    assert p.mmsi == 257000001
-    assert p.sog is None and p.cog is None and p.heading is None and p.name is None
-
-
-def test_position_rejects_out_of_range_lat():
-    with pytest.raises(ValidationError):
-        _pos(lat=120.0)
-
-
-def test_position_rejects_out_of_range_lon():
-    with pytest.raises(ValidationError):
-        _pos(lon=200.0)
-
-
-def test_track_computed_properties():
-    positions = [_pos(t=0), _pos(t=5), _pos(t=10)]
-    track = VesselTrack(mmsi=257000001, name="TEST", positions=positions)
-    assert track.count == 3
-    assert track.start_time == positions[0].timestamp
-    assert track.end_time == positions[-1].timestamp
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_model.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.model'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/polarwatch/model.py
-from datetime import datetime
-
-from pydantic import BaseModel, field_validator
-
-
-class AisPosition(BaseModel):
-    """A single normalized AIS position report for one vessel."""
-
-    mmsi: int
-    timestamp: datetime
-    lat: float
-    lon: float
-    sog: float | None = None  # speed over ground, knots
-    cog: float | None = None  # course over ground, degrees
-    heading: float | None = None  # true heading, degrees
-    name: str | None = None
-
-    @field_validator("lat")
-    @classmethod
-    def _check_lat(cls, v: float) -> float:
-        if not -90.0 <= v <= 90.0:
-            raise ValueError(f"lat {v} out of range [-90, 90]")
-        return v
-
-    @field_validator("lon")
-    @classmethod
-    def _check_lon(cls, v: float) -> float:
-        if not -180.0 <= v <= 180.0:
-            raise ValueError(f"lon {v} out of range [-180, 180]")
-        return v
-
-    @field_validator("mmsi")
-    @classmethod
-    def _check_mmsi(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError(f"mmsi {v} must be positive")
-        return v
-
-
-class VesselTrack(BaseModel):
-    """All positions for one vessel (MMSI), ordered by time."""
-
-    mmsi: int
-    name: str | None = None
-    positions: list[AisPosition]
-
-    @property
-    def count(self) -> int:
-        return len(self.positions)
-
-    @property
-    def start_time(self) -> datetime:
-        return self.positions[0].timestamp
-
-    @property
-    def end_time(self) -> datetime:
-        return self.positions[-1].timestamp
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_model.py -v`
-Expected: 4 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/polarwatch/model.py tests/test_model.py
-git commit -m "feat: add AisPosition and VesselTrack models"
-```
-
----
-
-## Task 3: Record normalization (raw AIS → `AisPosition`)
-
-**Files:**
-- Create: `src/polarwatch/normalize.py`
-- Test: `tests/test_normalize.py`
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# tests/test_normalize.py
-from datetime import datetime, timezone
-
-from polarwatch.normalize import normalize_record
-
-
-RAW = {
-    "mmsi": 257000001,
-    "latitude": 70.5,
-    "longitude": 19.25,
-    "speedOverGround": 12.3,
-    "courseOverGround": 88.0,
-    "trueHeading": 90,
-    "name": "TEST VESSEL",
-    "msgtime": "2026-06-01T00:00:00Z",
-}
-
-
-def test_normalize_maps_all_fields():
-    p = normalize_record(RAW)
-    assert p.mmsi == 257000001
-    assert p.lat == 70.5 and p.lon == 19.25
-    assert p.sog == 12.3 and p.cog == 88.0 and p.heading == 90.0
-    assert p.name == "TEST VESSEL"
-    assert p.timestamp == datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
-
-
-def test_normalize_tolerates_missing_optional_fields():
-    p = normalize_record(
-        {"mmsi": 257000002, "latitude": 71.0, "longitude": 20.0, "msgtime": "2026-06-01T01:00:00Z"}
-    )
-    assert p.sog is None and p.cog is None and p.heading is None and p.name is None
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_normalize.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.normalize'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/polarwatch/normalize.py
-from polarwatch.model import AisPosition
-
-
-def normalize_record(raw: dict) -> AisPosition:
-    """Map a raw BarentsWatch-shaped AIS record to a normalized AisPosition.
-
-    The synthetic generator and the live BarentsWatch client both emit this
-    shape, so this is the single normalization path for all ingest.
-    """
-    return AisPosition(
-        mmsi=int(raw["mmsi"]),
-        timestamp=raw["msgtime"],  # pydantic parses the ISO 8601 string
-        lat=float(raw["latitude"]),
-        lon=float(raw["longitude"]),
-        sog=raw.get("speedOverGround"),
-        cog=raw.get("courseOverGround"),
-        heading=raw.get("trueHeading"),
-        name=raw.get("name"),
-    )
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_normalize.py -v`
-Expected: 2 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/polarwatch/normalize.py tests/test_normalize.py
-git commit -m "feat: add raw AIS record normalization"
-```
-
----
-
-## Task 4: Parquet I/O & NDJSON reading
-
-**Files:**
-- Create: `src/polarwatch/parquet_io.py`
-- Test: `tests/test_parquet_io.py`
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# tests/test_parquet_io.py
-import json
-from datetime import datetime, timezone
-
-from polarwatch.model import AisPosition
-from polarwatch.parquet_io import (
-    read_ndjson_records,
-    read_positions,
-    write_positions,
-)
-
-
-def _pos(mmsi=257000001, minute=0, sog=None):
-    return AisPosition(
-        mmsi=mmsi,
-        timestamp=datetime(2026, 6, 1, 0, minute, 0, tzinfo=timezone.utc),
-        lat=70.0,
-        lon=20.0,
-        sog=sog,
-    )
-
-
-def test_write_then_read_roundtrips_positions(tmp_path):
-    positions = [_pos(minute=0, sog=10.0), _pos(minute=1, sog=None)]
-    path = tmp_path / "day.parquet"
-    write_positions(positions, path)
-    loaded = read_positions(path)
-    assert len(loaded) == 2
-    assert loaded[0].mmsi == 257000001
-    assert loaded[0].sog == 10.0
-    assert loaded[1].sog is None  # NaN must come back as None
-
-
-def test_read_ndjson_records(tmp_path):
-    path = tmp_path / "raw.ndjson"
-    rows = [
-        {"mmsi": 1, "latitude": 70.0, "longitude": 20.0, "msgtime": "2026-06-01T00:00:00Z"},
-        {"mmsi": 2, "latitude": 71.0, "longitude": 21.0, "msgtime": "2026-06-01T00:01:00Z"},
-    ]
-    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    records = list(read_ndjson_records(path))
-    assert len(records) == 2
-    assert records[0]["mmsi"] == 1
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_parquet_io.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.parquet_io'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/polarwatch/parquet_io.py
-import json
-from pathlib import Path
-from typing import Iterator
-
-import pandas as pd
-
-from polarwatch.model import AisPosition
-
-
-def write_positions(positions: list[AisPosition], path: str | Path) -> None:
-    """Write normalized positions to a Parquet file."""
-    frame = pd.DataFrame([p.model_dump() for p in positions])
-    frame.to_parquet(path, index=False)
-
-
-def read_positions(path: str | Path) -> list[AisPosition]:
-    """Read positions back from Parquet, restoring None for missing values."""
-    frame = pd.read_parquet(path)
-    # Parquet/pandas represent missing floats as NaN; convert back to None.
-    frame = frame.astype(object).where(pd.notnull(frame), None)
-    return [AisPosition(**row) for row in frame.to_dict("records")]
-
-
-def read_ndjson_records(path: str | Path) -> Iterator[dict]:
-    """Yield raw records from a newline-delimited JSON capture file."""
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_parquet_io.py -v`
-Expected: 2 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/polarwatch/parquet_io.py tests/test_parquet_io.py
-git commit -m "feat: add Parquet I/O and NDJSON reader"
-```
-
----
-
-## Task 5: Synthetic Barents-Sea day generator
-
-**Files:**
-- Create: `src/polarwatch/synth.py`
-- Test: `tests/test_synth.py`
-
-This generator is the deterministic, reproducible fixture for tests and the offline demo. It emits the same raw record shape the live client produces.
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# tests/test_synth.py
-from datetime import timezone
-
-from polarwatch.normalize import normalize_record
-from polarwatch.synth import generate_day
-
-
-def test_record_count_matches_vessels_times_steps():
-    records = generate_day(vessels=3, hours=1, interval_seconds=60, seed=1)
-    # 1 hour / 60s = 60 steps per vessel
-    assert len(records) == 3 * 60
-
-
-def test_deterministic_for_same_seed():
-    a = generate_day(vessels=2, hours=1, interval_seconds=300, seed=42)
-    b = generate_day(vessels=2, hours=1, interval_seconds=300, seed=42)
-    assert a == b
-
-
-def test_records_are_normalizable_and_in_barents_region():
-    records = generate_day(vessels=2, hours=1, interval_seconds=300, seed=7)
-    for raw in records:
-        p = normalize_record(raw)
-        assert p.timestamp.tzinfo == timezone.utc
-        assert 60.0 <= p.lat <= 82.0  # broad Barents/Svalbard latitude band
-        assert 0.0 <= p.lon <= 40.0
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_synth.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.synth'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/polarwatch/synth.py
-import math
-import random
-from datetime import datetime, timedelta, timezone
-
-# A nominal start of day in the Barents Sea region.
-_DEFAULT_START = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
-
-
-def generate_day(
-    vessels: int = 5,
-    hours: int = 24,
-    interval_seconds: int = 60,
-    seed: int = 0,
-    start: datetime | None = None,
-) -> list[dict]:
-    """Generate a deterministic day of synthetic AIS records in BarentsWatch shape.
-
-    Each vessel dead-reckons from a random start position on a fixed course and
-    speed, producing one record every `interval_seconds`. Output is sorted by
-    time so it is ready for the replay engine.
-    """
-    start = start or _DEFAULT_START
-    rng = random.Random(seed)
-    steps = int(hours * 3600 / interval_seconds)
-    records: list[dict] = []
-
-    for v in range(vessels):
-        mmsi = 257000001 + v
-        lat = 68.0 + rng.uniform(0.0, 8.0)   # 68–76 N
-        lon = 12.0 + rng.uniform(0.0, 20.0)  # 12–32 E
-        course = rng.uniform(0.0, 360.0)
-        speed = rng.uniform(5.0, 15.0)  # knots
-        name = f"SYNTH {mmsi}"
-
-        for s in range(steps):
-            t = start + timedelta(seconds=s * interval_seconds)
-            # Approximate movement: 1 knot ~= 1 nm/h; 1 nm ~= 1/60 degree latitude.
-            dist_nm = speed * (interval_seconds / 3600.0)
-            dlat = (dist_nm / 60.0) * math.cos(math.radians(course))
-            dlon = (dist_nm / 60.0) * math.sin(math.radians(course)) / max(
-                math.cos(math.radians(lat)), 0.1
-            )
-            lat = max(60.0, min(82.0, lat + dlat))
-            lon = max(0.0, min(40.0, lon + dlon))
-            records.append(
-                {
-                    "mmsi": mmsi,
-                    "latitude": round(lat, 5),
-                    "longitude": round(lon, 5),
-                    "speedOverGround": round(speed, 1),
-                    "courseOverGround": round(course, 1),
-                    "trueHeading": int(course),
-                    "name": name,
-                    "msgtime": t.isoformat().replace("+00:00", "Z"),
-                }
-            )
-
-    records.sort(key=lambda r: r["msgtime"])
-    return records
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_synth.py -v`
-Expected: 3 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/polarwatch/synth.py tests/test_synth.py
-git commit -m "feat: add deterministic synthetic AIS day generator"
-```
-
----
-
-## Task 6: BarentsWatch live capture client
-
-**Files:**
-- Create: `src/polarwatch/barentswatch.py`
-- Test: `tests/test_barentswatch.py`
-
-The client is network-isolated: it accepts an `httpx.Client`, so tests drive it with `httpx.MockTransport` and never touch the network.
-
-- [ ] **Step 1: Verify the live endpoints against current docs (real-data correctness)**
-
-This task's logic is fully tested offline, but the live endpoint paths must be confirmed before running against real data. Check the current BarentsWatch open-AIS docs and confirm/adjust the two constants in the implementation (`TOKEN_URL`, `POSITIONS_URL`) and the auth `scope`:
-
-Run:
-```bash
-# Inspect the documented token + AIS endpoints; correct the constants below if they differ.
-curl -s https://www.barentswatch.no/en/articles/open-data-ais/ | head -c 4000
-```
-Expected: token endpoint under `id.barentswatch.no/connect/token`, AIS API under `live.ais.barentswatch.no`. If the positions path differs from `/v1/latest/combined`, update `POSITIONS_URL` to match. The offline tests below do not depend on the exact path.
-
-- [ ] **Step 2: Write the failing tests**
-
-```python
-# tests/test_barentswatch.py
-import httpx
-
-from polarwatch.barentswatch import fetch_positions, get_token
-
-
-def _client(handler):
-    return httpx.Client(transport=httpx.MockTransport(handler))
-
-
-def test_get_token_returns_access_token():
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/connect/token")
-        return httpx.Response(200, json={"access_token": "tok-123", "expires_in": 3600})
-
-    with _client(handler) as client:
-        assert get_token(client, "id", "secret") == "tok-123"
-
-
-def test_fetch_positions_sends_bearer_and_returns_list():
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Authorization"] == "Bearer tok-123"
-        return httpx.Response(
-            200,
-            json=[
-                {"mmsi": 257000001, "latitude": 70.0, "longitude": 20.0, "msgtime": "2026-06-01T00:00:00Z"}
-            ],
-        )
-
-    with _client(handler) as client:
-        records = fetch_positions(client, "tok-123")
-    assert len(records) == 1
-    assert records[0]["mmsi"] == 257000001
-```
-
-- [ ] **Step 3: Run tests to verify they fail**
-
-Run: `pytest tests/test_barentswatch.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.barentswatch'`
-
-- [ ] **Step 4: Write the implementation**
-
-```python
-# src/polarwatch/barentswatch.py
-import httpx
-
-# Confirmed in Task 6 Step 1 against current BarentsWatch open-AIS docs.
-TOKEN_URL = "https://id.barentswatch.no/connect/token"
-POSITIONS_URL = "https://live.ais.barentswatch.no/v1/latest/combined"
-SCOPE = "ais"
-
-
-def get_token(client: httpx.Client, client_id: str, client_secret: str) -> str:
-    """Obtain an OAuth2 access token via the client-credentials grant."""
-    response = client.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": SCOPE,
-        },
-    )
-    response.raise_for_status()
-    return response.json()["access_token"]
-
-
-def fetch_positions(client: httpx.Client, token: str) -> list[dict]:
-    """Fetch the latest AIS positions. Returns raw BarentsWatch-shaped records."""
-    response = client.get(POSITIONS_URL, headers={"Authorization": f"Bearer {token}"})
-    response.raise_for_status()
-    return response.json()
-```
-
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `pytest tests/test_barentswatch.py -v`
-Expected: 2 passed
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/polarwatch/barentswatch.py tests/test_barentswatch.py
-git commit -m "feat: add BarentsWatch AIS capture client"
-```
-
----
-
-## Task 7: Track builder
-
-**Files:**
-- Create: `src/polarwatch/tracks.py`
-- Test: `tests/test_tracks.py`
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# tests/test_tracks.py
-from datetime import datetime, timezone
-
-from polarwatch.model import AisPosition
-from polarwatch.tracks import build_tracks
-
-
-def _pos(mmsi, minute, name=None):
-    return AisPosition(
-        mmsi=mmsi,
-        timestamp=datetime(2026, 6, 1, 0, minute, 0, tzinfo=timezone.utc),
-        lat=70.0,
-        lon=20.0,
-        name=name,
-    )
-
-
-def test_groups_by_mmsi():
-    positions = [_pos(1, 0), _pos(2, 0), _pos(1, 1)]
-    tracks = build_tracks(positions)
-    by_mmsi = {t.mmsi: t for t in tracks}
-    assert set(by_mmsi) == {1, 2}
-    assert by_mmsi[1].count == 2
-    assert by_mmsi[2].count == 1
-
-
-def test_positions_sorted_by_time_within_track():
-    positions = [_pos(1, 5), _pos(1, 0), _pos(1, 3)]
-    track = build_tracks(positions)[0]
-    minutes = [p.timestamp.minute for p in track.positions]
-    assert minutes == [0, 3, 5]
-
-
-def test_track_name_taken_from_first_named_position():
-    positions = [_pos(1, 0, name=None), _pos(1, 1, name="NORDLYS")]
-    track = build_tracks(positions)[0]
-    assert track.name == "NORDLYS"
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_tracks.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.tracks'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/polarwatch/tracks.py
-from collections import defaultdict
-
-from polarwatch.model import AisPosition, VesselTrack
-
-
-def build_tracks(positions: list[AisPosition]) -> list[VesselTrack]:
-    """Group positions by MMSI into per-vessel tracks, sorted by time."""
-    grouped: dict[int, list[AisPosition]] = defaultdict(list)
-    for position in positions:
-        grouped[position.mmsi].append(position)
-
-    tracks: list[VesselTrack] = []
-    for mmsi, group in grouped.items():
-        group.sort(key=lambda p: p.timestamp)
-        name = next((p.name for p in group if p.name), None)
-        tracks.append(VesselTrack(mmsi=mmsi, name=name, positions=group))
-    return tracks
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_tracks.py -v`
-Expected: 3 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/polarwatch/tracks.py tests/test_tracks.py
-git commit -m "feat: add per-vessel track builder"
-```
-
----
-
-## Task 8: Clock-driven replay engine
-
-**Files:**
-- Create: `src/polarwatch/replay.py`
-- Test: `tests/test_replay.py`
-
-- [ ] **Step 1: Write the failing tests**
-
-```python
-# tests/test_replay.py
-from datetime import datetime, timezone
-
-from polarwatch.model import AisPosition
-from polarwatch.replay import replay
-
-
-def _pos(second):
-    return AisPosition(
-        mmsi=1,
-        timestamp=datetime(2026, 6, 1, 0, 0, second, tzinfo=timezone.utc),
-        lat=70.0,
-        lon=20.0,
-    )
-
-
-def test_emits_all_positions_in_time_order():
-    positions = [_pos(30), _pos(0), _pos(10)]  # unsorted on input
-    sleeps: list[float] = []
-    emitted = list(replay(positions, speed=1.0, sleep=sleeps.append))
-    seconds = [p.timestamp.second for p in emitted]
-    assert seconds == [0, 10, 30]
-
-
-def test_sleeps_scaled_by_speed():
-    positions = [_pos(0), _pos(10), _pos(30)]
-    sleeps: list[float] = []
-    list(replay(positions, speed=10.0, sleep=sleeps.append))
-    # gaps of 10s and 20s, divided by speed 10 -> 1.0s and 2.0s
-    assert sleeps == [1.0, 2.0]
-
-
-def test_first_position_emits_without_sleeping():
-    positions = [_pos(0), _pos(5)]
-    sleeps: list[float] = []
-    list(replay(positions, speed=1.0, sleep=sleeps.append))
-    assert len(sleeps) == 1  # only one gap, before the second position
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `pytest tests/test_replay.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'polarwatch.replay'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/polarwatch/replay.py
-import time
-from typing import Callable, Iterable, Iterator
-
-from polarwatch.model import AisPosition
-
-
-def replay(
-    positions: Iterable[AisPosition],
-    speed: float = 1.0,
-    sleep: Callable[[float], None] = time.sleep,
-) -> Iterator[AisPosition]:
-    """Yield positions in timestamp order, pacing emission like a live feed.
-
-    Between consecutive positions, waits (gap_seconds / speed). The `sleep`
-    callable is injectable so tests run instantly and the UI can drive its own
-    clock later. `speed` > 1 plays faster than real time.
-    """
-    ordered = sorted(positions, key=lambda p: p.timestamp)
-    previous: AisPosition | None = None
-    for position in ordered:
-        if previous is not None:
-            gap = (position.timestamp - previous.timestamp).total_seconds() / speed
-            if gap > 0:
-                sleep(gap)
-        previous = position
-        yield position
-```
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `pytest tests/test_replay.py -v`
-Expected: 3 passed
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/polarwatch/replay.py tests/test_replay.py
-git commit -m "feat: add clock-driven replay engine"
-```
-
----
-
-## Task 9: CLI wiring + end-to-end pipeline test
-
-**Files:**
-- Create: `src/polarwatch/cli.py`
-- Test: `tests/test_end_to_end.py`
-
-This task ties the stages together and proves the Phase 1 done-criterion: **a Barents Sea day replays through the pipeline.**
-
-- [ ] **Step 1: Write the failing end-to-end test**
-
-```python
-# tests/test_end_to_end.py
-import json
-
-from polarwatch.normalize import normalize_record
-from polarwatch.parquet_io import (
-    read_ndjson_records,
-    read_positions,
-    write_positions,
-)
-from polarwatch.replay import replay
-from polarwatch.synth import generate_day
-from polarwatch.tracks import build_tracks
-
-
-def test_synthetic_day_replays_through_pipeline(tmp_path):
-    # 1. Generate a synthetic Barents Sea day.
-    records = generate_day(vessels=4, hours=2, interval_seconds=300, seed=3)
-    expected_count = 4 * int(2 * 3600 / 300)
-    assert len(records) == expected_count
-
-    # 2. Capture to NDJSON (the canonical pipeline input).
-    ndjson = tmp_path / "day.ndjson"
-    ndjson.write_text("\n".join(json.dumps(r) for r in records) + "\n")
-
-    # 3. Ingest: normalize raw records -> positions -> Parquet.
-    positions = [normalize_record(r) for r in read_ndjson_records(ndjson)]
-    parquet = tmp_path / "day.parquet"
-    write_positions(positions, parquet)
-
-    # 4. Build tracks.
-    loaded = read_positions(parquet)
-    tracks = build_tracks(loaded)
-    assert len(tracks) == 4
-
-    # 5. Replay the whole day instantly (recorded sleeps, no real waiting).
-    sleeps: list[float] = []
-    emitted = list(replay(loaded, speed=1.0, sleep=sleeps.append))
-
-    # Every position flows through, in non-decreasing time order.
-    assert len(emitted) == expected_count
-    times = [p.timestamp for p in emitted]
-    assert times == sorted(times)
-```
-
-- [ ] **Step 2: Run the test to confirm the pipeline composes**
-
-This is an integration test over modules built in Tasks 2–8, so it should PASS immediately (there is no new production code to make it go red). It verifies the stages compose correctly end-to-end.
-
-Run: `pytest tests/test_end_to_end.py -v`
-Expected: 1 passed. If it fails, fix the offending module from Tasks 2–8 before continuing.
-
-- [ ] **Step 3: Write the CLI**
-
-```python
-# src/polarwatch/cli.py
-import json
-import os
-from pathlib import Path
-
-import httpx
-import typer
-
-from polarwatch.barentswatch import fetch_positions, get_token
-from polarwatch.normalize import normalize_record
-from polarwatch.parquet_io import read_ndjson_records, read_positions, write_positions
-from polarwatch.replay import replay
-from polarwatch.synth import generate_day
-from polarwatch.tracks import build_tracks
-
-app = typer.Typer(help="PolarWatch — dark vessel detection pipeline (Phase 0–1).")
-
-
-def _write_ndjson(records: list[dict], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record) + "\n")
-
-
-@app.command("synth-day")
-def synth_day(
-    out: Path = typer.Option(Path("data/day.ndjson"), help="Output NDJSON path."),
-    vessels: int = 8,
-    hours: int = 24,
-    interval_seconds: int = 60,
-    seed: int = 0,
-) -> None:
-    """Generate a deterministic synthetic Barents-Sea AIS day."""
-    records = generate_day(vessels=vessels, hours=hours, interval_seconds=interval_seconds, seed=seed)
-    _write_ndjson(records, out)
-    typer.echo(f"Wrote {len(records)} records to {out}")
-
-
-@app.command("ingest")
-def ingest(
-    in_path: Path = typer.Option(Path("data/day.ndjson"), "--in", help="Raw NDJSON capture."),
-    out: Path = typer.Option(Path("data/day.parquet"), help="Normalized Parquet output."),
-) -> None:
-    """Normalize a raw AIS capture into a Parquet positions file."""
-    positions = [normalize_record(r) for r in read_ndjson_records(in_path)]
-    out.parent.mkdir(parents=True, exist_ok=True)
-    write_positions(positions, out)
-    typer.echo(f"Ingested {len(positions)} positions -> {out}")
-
-
-@app.command("replay")
-def replay_cmd(
-    in_path: Path = typer.Option(Path("data/day.parquet"), "--in", help="Parquet positions file."),
-    speed: float = typer.Option(3600.0, help="Replay speed multiplier (default: 1h/s)."),
-    limit: int = typer.Option(0, help="Stop after N positions (0 = all)."),
-) -> None:
-    """Replay a positions file through the clock-driven engine."""
-    positions = read_positions(in_path)
-    tracks = build_tracks(positions)
-    typer.echo(f"Replaying {len(positions)} positions across {len(tracks)} vessels (speed={speed})")
-    count = 0
-    for position in replay(positions, speed=speed):
-        count += 1
-        if limit and count >= limit:
-            break
-    typer.echo(f"Replayed {count} positions.")
-
-
-@app.command("capture")
-def capture(
-    out: Path = typer.Option(Path("data/capture.ndjson"), help="Output NDJSON path."),
-) -> None:
-    """Capture one batch of live BarentsWatch AIS positions (needs credentials)."""
-    client_id = os.environ.get("BARENTSWATCH_CLIENT_ID")
-    client_secret = os.environ.get("BARENTSWATCH_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise typer.BadParameter("Set BARENTSWATCH_CLIENT_ID and BARENTSWATCH_CLIENT_SECRET (.env).")
-    with httpx.Client(timeout=30.0) as client:
-        token = get_token(client, client_id, client_secret)
-        records = fetch_positions(client, token)
-    _write_ndjson(records, out)
-    typer.echo(f"Captured {len(records)} live positions -> {out}")
-
-
-@app.command("demo")
-def demo() -> None:
-    """End-to-end offline demo: synth a day, ingest, and replay it fast."""
-    records = generate_day(vessels=8, hours=24, interval_seconds=300, seed=0)
-    positions = [normalize_record(r) for r in records]
-    tracks = build_tracks(positions)
-    typer.echo(f"Demo: {len(positions)} positions across {len(tracks)} vessels.")
-    count = sum(1 for _ in replay(positions, speed=1_000_000.0))
-    typer.echo(f"Demo replayed {count} positions through the pipeline. OK.")
-
-
-if __name__ == "__main__":
-    app()
-```
-
-- [ ] **Step 4: Verify the CLI runs end-to-end**
-
-Run:
-```bash
-polarwatch synth-day --out data/day.ndjson --vessels 8 --hours 24 --interval-seconds 300 --seed 0
-polarwatch ingest --in data/day.ndjson --out data/day.parquet
-polarwatch replay --in data/day.parquet --speed 1000000
-```
-Expected: synth-day reports `Wrote 2304 records`, ingest reports `Ingested 2304 positions`, replay reports `Replayed 2304 positions.`
-
-- [ ] **Step 5: Run the full test suite**
-
-Run: `pytest -v`
-Expected: all tests pass (model, normalize, parquet_io, synth, barentswatch, tracks, replay, end_to_end).
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/polarwatch/cli.py tests/test_end_to_end.py
-git commit -m "feat: wire CLI and prove end-to-end day replay"
-```
-
----
-
-## Task 10: Docker stack + README
-
-**Files:**
-- Create: `Dockerfile`, `docker-compose.yml`, `README.md`
-
-Proves the Phase 0 done-criterion: **one command boots the stack.** Redis and PostGIS are included now as empty placeholders pre-wired for Phase 2's entity store.
-
-- [ ] **Step 1: Create `Dockerfile`**
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY pyproject.toml ./
-COPY src ./src
-RUN pip install --no-cache-dir .
-
-CMD ["polarwatch", "demo"]
-```
-
-- [ ] **Step 2: Create `docker-compose.yml`**
-
-```yaml
-services:
-  app:
-    build: .
-    env_file:
-      - .env
-    depends_on:
-      - redis
-      - postgis
-    command: ["polarwatch", "demo"]
-
-  # Phase 2 placeholders (entity store state + history). Boot empty for now.
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  postgis:
-    image: postgis/postgis:16-3.4
-    environment:
-      POSTGRES_PASSWORD: polarwatch
-      POSTGRES_DB: polarwatch
-    ports:
-      - "5432:5432"
-```
-
-- [ ] **Step 3: Create `README.md`**
-
-```markdown
-# PolarWatch
-
-An open-data prototype of a maritime-domain-awareness pipeline — it detects dark
-and anomalous vessel behavior in the Arctic, fuses two sensor sources, and
-presents them in a unified entity model and operating picture.
-
-> **Phase 0–1 (Foundation) is implemented:** AIS ingest, per-vessel track
-> building, and a clock-driven replay engine. See
-> `docs/superpowers/specs/2026-06-02-polarwatch-design.md` for the full design
-> and roadmap (entity store, detection, fusion, and the operator UI follow).
-
-## Quickstart (local)
-
-```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
-pytest                      # run the test suite
-
-# Offline end-to-end demo (no credentials needed):
-polarwatch synth-day --out data/day.ndjson
-polarwatch ingest    --in  data/day.ndjson --out data/day.parquet
-polarwatch replay    --in  data/day.parquet --speed 3600
-```
-
-## Live data (optional)
-
-Register a client for Norway's BarentsWatch open AIS API, copy `.env.example`
-to `.env`, fill in the credentials, then:
-
-```bash
-polarwatch capture --out data/capture.ndjson
-polarwatch ingest  --in  data/capture.ndjson --out data/capture.parquet
-polarwatch replay  --in  data/capture.parquet
-```
-
-## Run the stack
+- [ ] **Step 2: Document Phase 1 quickstart**
 
 ```bash
 docker compose up --build
+python scripts/load_ais.py ...
+# open http://localhost:5173 (or documented URL)
 ```
 
-Boots the app (runs the offline demo) plus Redis and PostGIS (placeholders for
-the Phase 2 entity store).
+- [ ] **Step 3: Document chosen scenario**
 
-## Pipeline (Phase 0–1)
+Record the bbox, date window, AIS source, and SAR scene time that passed the spike.
+
+- [ ] **Step 4: Architecture diagram (ASCII or mermaid)**
 
 ```
-synth-day / capture   raw AIS (NDJSON, BarentsWatch shape)
-        │
-        ▼  normalize
-   positions (Parquet)
-        │
-        ├─ build_tracks ─▶ per-vessel VesselTrack
-        ▼
-   replay (clock-driven, speed-controlled)
+AIS file/DB ──► replay clock ──► WebSocket ──► deck.gl map
+                     ▲
+              replay controls
 ```
-```
-
-- [ ] **Step 4: Verify the stack boots**
-
-Run: `docker compose up --build`
-Expected: `redis` and `postgis` start; `app` builds, runs the demo, and logs `Demo replayed ... positions through the pipeline. OK.` (Press Ctrl-C to stop; `docker compose down` to clean up.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Dockerfile docker-compose.yml README.md
-git commit -m "feat: add Docker stack and project README"
+git add README.md
+git commit -m "docs: add DarkWake Phase 0–1 README and quickstart"
 ```
 
 ---
 
-## Self-Review Notes
+## Self-review notes
 
-**Spec coverage (Phase 0–1 scope only):**
-- Phase 0 "Repo, Docker Compose, data keys, README skeleton; one command boots the empty stack" → Tasks 1, 10 (+ `.env.example` data keys in Task 1). ✅
-- Phase 1 "AIS ingest" → Tasks 3, 4, 6. ✅
-- Phase 1 "track builder" → Task 7. ✅
-- Phase 1 "clock-driven replay" → Task 8. ✅
-- Phase 1 done-criterion "a Barents Sea day replays through the pipeline" → Task 9 end-to-end test + CLI run. ✅
-- Spec §4 "normalize to a common schema" → Tasks 2, 3. ✅
-- Spec data strategy "Kystverket/BarentsWatch primary AIS" → Task 6 (live), Task 5 (synthetic reproducible fixture). ✅
+**Spec coverage (Phase 0–1 only):**
 
-**Intentionally deferred (later phases, not Phase 0–1):** entity store/gRPC-REST service (Phase 2), detection rules (Phase 3), UI (Phase 4), fusion + second sensor (Phase 5), ML + eval harness (Phase 6), GeoParquet/geopandas spatial features. These are explicitly out of scope here.
+| Spec § | Requirement | Plan task |
+|---|---|---|
+| §4 | AOI is config; confirm overlap before building | Tasks 1, 4 |
+| §5 | GFW SAR + AIS source (DMA/Fintraffic/AISStream) | Tasks 2, 3 |
+| §6 | PostGIS, FastAPI, GeoPandas/Shapely, deck.gl + MapLibre | Tasks 5–9 |
+| §7 | `vessel`, `ais_position` schema | Task 5 |
+| §10 | `/ws/replay` with play/pause/seek/speed; minimal REST | Tasks 7, 8 |
+| §11 | AIS vessels on dark basemap; replay controls | Task 9 |
+| §13 Phase 0 | Overlap spike done-criterion | Task 4 |
+| §13 Phase 1 | AIS on map, replayable, no fusion | Tasks 5–9 |
+| §14 | Thresholds in config; geometry discipline; one phase at a time | Tasks 1, 5 |
 
-**Type consistency:** `AisPosition`/`VesselTrack` fields, `normalize_record`, `generate_day(vessels, hours, interval_seconds, seed)`, `build_tracks`, and `replay(positions, speed, sleep)` signatures are used identically across Tasks 2–9 and the CLI. ✅
+**Intentionally deferred (Phase 2+ per spec §13):**
 
-**Open verification item:** Task 6 Step 1 — confirm the live BarentsWatch `POSITIONS_URL` against current docs before capturing real data. All other logic is tested offline and does not depend on it.
-```
+- Gap detection and dead-reckoning (`detection/gaps.py`, `fusion/predict.py`) — Phase 2
+- SAR fusion, matcher, dark contacts, connector lines — Phase 3
+- Re-identification, suspicion score, asset layer — Phase 4
+- Behavioral rules (`detection/behavior.py`) — Phase 5
+- Spoofing, custom SAR detector, live mode — Phase 6 optional flexes
+
+**Migration note:** Existing `src/polarwatch/model.py` and `tests/test_model.py` are from the superseded PolarWatch plan. They are not part of the DarkWake data model (PostGIS geometry, not Pydantic-only Parquet). Remove or replace during Task 1 restructure.
+
+**Open verification items:**
+
+- Confirm DMA CSV geographic coverage reaches the Gulf of Finland bbox; switch to Fintraffic or AISStream if not.
+- Confirm GFW REST endpoint and auth against current GFW docs before relying on live pulls.
+- Tune default scenario dates after first successful overlap spike; document the working window in README.

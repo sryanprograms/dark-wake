@@ -10,3 +10,6 @@ data/
 *.egg-info/
 dist/
 build/
+node_modules/
+frontend/dist/
+backend/.venv/
