@@ -21,6 +21,14 @@ fi
 
 export DATABASE_URL="${DATABASE_URL:-postgresql://darkwake:darkwake@localhost:5432/darkwake}"
 
+# Load repo-root secrets (AISSTREAM_API_KEY, GFW_API_TOKEN, …)
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
+
 echo "Applying migrations..."
 cd "$ROOT/backend"
 python -m app.db.migrate

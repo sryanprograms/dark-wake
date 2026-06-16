@@ -1,4 +1,4 @@
-import { Cable, Layers, MapPin, Route, Ship } from "lucide-react";
+import { Cable, Layers, MapPin, Radar, Route, Ship } from "lucide-react";
 import type { LayerVisibility } from "../types/layers";
 
 type LayerTogglesProps = {
@@ -9,6 +9,7 @@ type LayerTogglesProps = {
 const ITEMS: { key: keyof LayerVisibility; label: string; icon: typeof Ship }[] = [
   { key: "vessels", label: "Contacts", icon: Ship },
   { key: "tracks", label: "Tracks", icon: Route },
+  { key: "sar", label: "SAR", icon: Radar },
   { key: "cables", label: "Cables", icon: Cable },
   { key: "corridor", label: "Corridor", icon: MapPin },
 ];

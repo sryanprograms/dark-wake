@@ -10,9 +10,13 @@ import httpx
 TELEGEOGRAPHY_CABLE_GEO_URL = (
     "https://www.submarinecablemap.com/api/v3/cable/cable-geo.json"
 )
+TELEGEOGRAPHY_CABLE_DETAIL_URL = (
+    "https://www.submarinecablemap.com/api/v3/cable/{cable_id}.json"
+)
 
 _CACHE_TTL_S = 3600
 _cache: dict[str, Any] = {"fetched_at": 0.0, "features": []}
+_detail_cache: dict[str, dict[str, Any]] = {}
 
 
 def _parse_hex_color(value: str | None) -> list[int] | None:
@@ -79,6 +83,56 @@ def parse_cable_features(
     return cables
 
 
+def parse_cable_detail(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract cable metadata from a TeleGeography detail response."""
+    landing_points = [
+        {"name": lp["name"], "country": lp.get("country")}
+        for lp in (payload.get("landing_points") or [])
+        if lp.get("name")
+    ]
+    is_planned = bool(payload.get("is_planned"))
+    return {
+        "length": payload.get("length") or None,
+        "owners": payload.get("owners") or None,
+        "suppliers": payload.get("suppliers") or None,
+        "rfs": payload.get("rfs") or None,
+        "status": "planned" if is_planned else "in_service",
+        "landing_points": landing_points,
+        "url": payload.get("url") or None,
+    }
+
+
+def fetch_cable_detail(client: httpx.Client, cable_id: str) -> dict[str, Any]:
+    if cable_id in _detail_cache:
+        return _detail_cache[cable_id]
+    url = TELEGEOGRAPHY_CABLE_DETAIL_URL.format(cable_id=cable_id)
+    response = client.get(url, timeout=30.0)
+    response.raise_for_status()
+    detail = parse_cable_detail(response.json())
+    _detail_cache[cable_id] = detail
+    return detail
+
+
+def enrich_cables_with_details(
+    cables: list[dict[str, Any]],
+    client: httpx.Client,
+) -> list[dict[str, Any]]:
+    """Attach per-cable metadata from TeleGeography detail API."""
+    if not cables:
+        return cables
+    details_by_id: dict[str, dict[str, Any]] = {}
+    for cable_id in {c["cable_id"] for c in cables}:
+        try:
+            details_by_id[cable_id] = fetch_cable_detail(client, cable_id)
+        except httpx.HTTPError:
+            details_by_id[cable_id] = {}
+    enriched: list[dict[str, Any]] = []
+    for cable in cables:
+        merged = {**cable, **details_by_id.get(cable["cable_id"], {})}
+        enriched.append(merged)
+    return enriched
+
+
 def fetch_cable_geojson(client: httpx.Client) -> dict[str, Any]:
     response = client.get(TELEGEOGRAPHY_CABLE_GEO_URL, timeout=120.0)
     response.raise_for_status()
@@ -106,7 +160,8 @@ def fetch_cables_in_bbox(
         client = httpx.Client()
     try:
         features = _cached_features(client)
-        return parse_cable_features({"features": features}, bbox)
+        cables = parse_cable_features({"features": features}, bbox)
+        return enrich_cables_with_details(cables, client)
     finally:
         if owns_client:
             client.close()

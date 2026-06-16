@@ -5,7 +5,9 @@ from datetime import timedelta
 # Fusion (spec §8)
 SAR_MATCH_RADIUS_M = 750
 SAR_MATCH_TIME_WINDOW_S = 600
-GAP_MIN_S = 900
+# AIS silence precursors (Tier 0) — not confirmed dark ships; see spec §8.
+GAP_MIN_S = 1800  # 30 min — minimum silence before any live alert
+GAP_HIGH_S = 3600  # 60 min — elevated severity / "suspicious" tier
 DR_MAX_PROJECTION_S = 7200
 SUSPICION_ASSET_BONUS = 0.3
 

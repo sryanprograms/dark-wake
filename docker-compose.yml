@@ -21,6 +21,8 @@ services:
     depends_on:
       postgis:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://darkwake:darkwake@postgis:5432/darkwake
     ports:

@@ -1,9 +1,21 @@
+export type CableLandingPoint = {
+  name: string;
+  country: string | null;
+};
+
 export type CableSegment = {
   id: string;
   cable_id: string;
   name: string;
   path: [number, number][];
   color: [number, number, number, number] | null;
+  length?: string | null;
+  owners?: string | null;
+  suppliers?: string | null;
+  rfs?: string | null;
+  status?: "planned" | "in_service";
+  landing_points?: CableLandingPoint[];
+  url?: string | null;
 };
 
 type CablesResponse = {

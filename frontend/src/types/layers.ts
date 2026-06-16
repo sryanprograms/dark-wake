@@ -3,6 +3,7 @@ export type LayerVisibility = {
   tracks: boolean;
   corridor: boolean;
   cables: boolean;
+  sar: boolean;
 };
 
 export const DEFAULT_LAYERS: LayerVisibility = {
@@ -10,4 +11,5 @@ export const DEFAULT_LAYERS: LayerVisibility = {
   tracks: true,
   corridor: true,
   cables: true,
+  sar: true,
 };

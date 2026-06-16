@@ -14,7 +14,9 @@ import { Search, Ship } from "lucide-react";
 import type { VesselPoint } from "../map/MapView";
 import { formatUtcShort } from "../utils/time";
 import { matchesShipTypeFilter } from "../utils/shipTypes";
+import { matchesNationFilter } from "../utils/nations";
 import { CollapsiblePanel } from "./CollapsiblePanel";
+import { NationFilter } from "./NationFilter";
 import { ShipTypeFilter } from "./ShipTypeFilter";
 
 type FleetPanelProps = {
@@ -24,6 +26,8 @@ type FleetPanelProps = {
   onCollapsedChange?: (collapsed: boolean) => void;
   shipTypeFilter: Set<string>;
   onShipTypeFilterChange: (types: Set<string>) => void;
+  nationFilter: Set<string>;
+  onNationFilterChange: (nations: Set<string>) => void;
 };
 
 type FleetRow = VesselPoint & { moving: boolean };
@@ -106,6 +110,8 @@ export function FleetPanel({
   onCollapsedChange,
   shipTypeFilter,
   onShipTypeFilterChange,
+  nationFilter,
+  onNationFilterChange,
 }: FleetPanelProps) {
   const [query, setQuery] = useState("");
   const [movingOnly, setMovingOnly] = useState(false);
@@ -149,8 +155,11 @@ export function FleetPanel({
     if (shipTypeFilter.size > 0) {
       rows = rows.filter((r) => matchesShipTypeFilter(r.original, shipTypeFilter));
     }
+    if (nationFilter.size > 0) {
+      rows = rows.filter((r) => matchesNationFilter(r.original, nationFilter));
+    }
     return rows;
-  }, [table, movingOnly, shipTypeFilter, query, sorting, data]);
+  }, [table, movingOnly, shipTypeFilter, nationFilter, query, sorting, data]);
 
   const virtualizer = useVirtualizer({
     count: filteredRows.length,
@@ -182,6 +191,11 @@ export function FleetPanel({
           vessels={vessels}
           selectedTypes={shipTypeFilter}
           onChange={onShipTypeFilterChange}
+        />
+        <NationFilter
+          vessels={vessels}
+          selectedNations={nationFilter}
+          onChange={onNationFilterChange}
         />
         <label className="fleet-toggle">
           <input

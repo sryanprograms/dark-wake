@@ -1,19 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchCables, type CableSegment } from "./api/cables";
+import { EventFeed } from "./components/EventFeed";
 import { FleetPanel } from "./components/FleetPanel";
 import { LayerToggles } from "./components/LayerToggles";
 import { TimelineDock } from "./components/TimelineDock";
 import { TopBar } from "./components/TopBar";
 import { VesselDetail } from "./components/VesselDetail";
-import { MapView, VesselPoint, VesselTrack } from "./map/MapView";
+import { MapView, VesselPoint, VesselTrack, type SarDetection } from "./map/MapView";
 import { DEFAULT_LAYERS, LayerVisibility } from "./types/layers";
 import { filterVesselsByShipType } from "./utils/shipTypes";
+import { filterVesselsByNation } from "./utils/nations";
 import { toMs } from "./utils/time";
+import {
+  AlertEvent,
+  connectLive,
+  LiveMessage,
+  LiveStateEvent,
+} from "./ws/live";
 import { AisEvent, connectReplay, ReplayMessage, WindowPreset } from "./ws/replay";
 
-const WS_URL =
-  (import.meta.env.VITE_WS_URL as string | undefined) ??
-  `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/ws/replay`;
+type AppMode = "live" | "replay";
 
 type Scenario = {
   id: string;
@@ -32,6 +38,19 @@ type Scenario = {
 };
 
 const WINDOW_PRESETS: WindowPreset[] = ["24h", "3d", "7d"];
+
+function getInitialMode(): AppMode {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("mode") === "replay" ? "replay" : "live";
+}
+
+function wsBaseUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return (
+    (import.meta.env.VITE_WS_URL as string | undefined) ??
+    `${proto}://${window.location.host}`
+  );
+}
 
 function aisToVessel(msg: AisEvent | Omit<AisEvent, "type">): VesselPoint {
   return {
@@ -53,16 +72,34 @@ function vesselsFromBatch(vessels: Omit<AisEvent, "type">[]): Map<number, Vessel
   return new Map(vessels.map((v) => [v.mmsi, aisToVessel(v)]));
 }
 
+function liveStateToScenario(msg: LiveStateEvent): Scenario {
+  const now = msg.current;
+  return {
+    id: msg.id,
+    name: msg.name,
+    start: now,
+    end: now,
+    dataStart: now,
+    dataEnd: now,
+    windowPreset: "24h",
+    bbox: msg.bbox,
+  };
+}
+
 export default function App() {
-  const clientRef = useRef<ReturnType<typeof connectReplay> | null>(null);
+  const [mode, setMode] = useState<AppMode>(getInitialMode);
+  const clientRef = useRef<ReturnType<typeof connectReplay> | ReturnType<typeof connectLive> | null>(null);
   const [vessels, setVessels] = useState<Map<number, VesselPoint>>(new Map());
   const [tracks, setTracks] = useState<VesselTrack[]>([]);
+  const [sarDetections, setSarDetections] = useState<SarDetection[]>([]);
+  const [alerts, setAlerts] = useState<AlertEvent[]>([]);
   const [scenario, setScenario] = useState<Scenario | null>(null);
   const [current, setCurrent] = useState("");
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(2);
   const [windowPreset, setWindowPreset] = useState<WindowPreset>("24h");
   const [connected, setConnected] = useState(false);
+  const [aisConnected, setAisConnected] = useState(false);
   const [positionCount, setPositionCount] = useState<number | null>(null);
   const [selectedMmsi, setSelectedMmsi] = useState<number | null>(null);
   const [centerRequest, setCenterRequest] = useState<{
@@ -75,6 +112,7 @@ export default function App() {
   const [fleetCollapsed, setFleetCollapsed] = useState(false);
   const [detailCollapsed, setDetailCollapsed] = useState(true);
   const [shipTypeFilter, setShipTypeFilter] = useState<Set<string>>(() => new Set());
+  const [nationFilter, setNationFilter] = useState<Set<string>>(() => new Set());
 
   const applyAis = useCallback((msg: AisEvent | Omit<AisEvent, "type">) => {
     setVessels((prev) => {
@@ -82,6 +120,17 @@ export default function App() {
       next.set(msg.mmsi, aisToVessel(msg));
       return next;
     });
+  }, []);
+
+  const switchMode = useCallback((next: AppMode) => {
+    const url = new URL(window.location.href);
+    if (next === "replay") {
+      url.searchParams.set("mode", "replay");
+    } else {
+      url.searchParams.delete("mode");
+    }
+    window.history.replaceState({}, "", url);
+    setMode(next);
   }, []);
 
   useEffect(() => {
@@ -99,7 +148,47 @@ export default function App() {
   }, [scenario?.bbox]);
 
   useEffect(() => {
-    const client = connectReplay(WS_URL, (msg: ReplayMessage) => {
+    clientRef.current?.close();
+    setConnected(false);
+    setVessels(new Map());
+    setTracks([]);
+    setSarDetections([]);
+    setAlerts([]);
+    setSelectedMmsi(null);
+    setPlaying(false);
+
+    if (mode === "live") {
+      const client = connectLive(`${wsBaseUrl()}/ws/live`, (msg: LiveMessage) => {
+        if (msg.type === "live_state") {
+          setScenario(liveStateToScenario(msg));
+          setCurrent(msg.current);
+          setPositionCount(msg.vessel_count);
+          setAisConnected(msg.ais_connected);
+          setConnected(true);
+        } else if (msg.type === "ais_batch") {
+          setVessels(vesselsFromBatch(msg.vessels));
+        } else if (msg.type === "tracks_batch") {
+          setTracks(msg.tracks);
+        } else if (msg.type === "ais") {
+          applyAis(msg);
+          setCurrent(msg.t);
+        } else if (msg.type === "sar_batch") {
+          setSarDetections((prev) => {
+            const byId = new Map(prev.map((d) => [d.id, d]));
+            for (const det of msg.detections) {
+              byId.set(det.id, det);
+            }
+            return Array.from(byId.values());
+          });
+        } else if (msg.type === "alert") {
+          setAlerts((prev) => [msg, ...prev].slice(0, 100));
+        }
+      });
+      clientRef.current = client;
+      return () => client.close();
+    }
+
+    const client = connectReplay(`${wsBaseUrl()}/ws/replay`, (msg: ReplayMessage) => {
       if (msg.type === "scenario") {
         setScenario({
           id: msg.id,
@@ -120,6 +209,7 @@ export default function App() {
         setTracks([]);
         setSelectedMmsi(null);
         setShipTypeFilter(new Set());
+        setNationFilter(new Set());
         clientRef.current?.send({ action: "speed", multiplier: speed });
       } else if (msg.type === "state") {
         setCurrent(msg.current);
@@ -134,25 +224,23 @@ export default function App() {
     });
     clientRef.current = client;
     return () => client.close();
-  }, [applyAis, speed]);
+  }, [applyAis, mode, speed]);
 
   const vesselList = useMemo(() => Array.from(vessels.values()), [vessels]);
-  const filteredVesselList = useMemo(
-    () => filterVesselsByShipType(vesselList, shipTypeFilter),
-    [vesselList, shipTypeFilter],
-  );
+  const filteredVesselList = useMemo(() => {
+    let list = filterVesselsByShipType(vesselList, shipTypeFilter);
+    list = filterVesselsByNation(list, nationFilter);
+    return list;
+  }, [vesselList, shipTypeFilter, nationFilter]);
   const filteredTracks = useMemo(() => {
-    if (shipTypeFilter.size === 0) return tracks;
+    if (shipTypeFilter.size === 0 && nationFilter.size === 0) return tracks;
     const visibleMmsis = new Set(filteredVesselList.map((vessel) => vessel.mmsi));
     return tracks.filter((track) => visibleMmsis.has(track.mmsi));
-  }, [tracks, filteredVesselList, shipTypeFilter]);
+  }, [tracks, filteredVesselList, shipTypeFilter, nationFilter]);
   const selectedVessel = selectedMmsi != null ? vessels.get(selectedMmsi) ?? null : null;
   const send = (payload: Record<string, unknown>) => clientRef.current?.send(payload);
 
-  const isLive = useMemo(() => {
-    if (!scenario || !current) return false;
-    return toMs(current) >= toMs(scenario.end) - 2000;
-  }, [scenario, current]);
+  const isLive = mode === "live" || (scenario != null && current !== "" && toMs(current) >= toMs(scenario.end) - 2000);
 
   const handleSelectVessel = useCallback((mmsi: number | null) => {
     setSelectedMmsi(mmsi);
@@ -176,6 +264,9 @@ export default function App() {
         trackCount={filteredTracks.length}
         positionCount={positionCount}
         isLive={isLive}
+        mode={mode}
+        aisConnected={aisConnected}
+        onModeChange={switchMode}
       />
 
       <div
@@ -190,6 +281,7 @@ export default function App() {
         <MapView
           vessels={filteredVesselList}
           tracks={filteredTracks}
+          sarDetections={sarDetections}
           bbox={scenario?.bbox}
           cables={cables}
           selectedMmsi={selectedMmsi}
@@ -206,6 +298,10 @@ export default function App() {
             selectedMmsi={selectedMmsi}
             onSelect={setSelectedMmsi}
             onCollapsedChange={setFleetCollapsed}
+            shipTypeFilter={shipTypeFilter}
+            onShipTypeFilterChange={setShipTypeFilter}
+            nationFilter={nationFilter}
+            onNationFilterChange={setNationFilter}
           />
         </div>
 
@@ -214,6 +310,7 @@ export default function App() {
         >
           <VesselDetail
             vessel={selectedVessel}
+            alerts={alerts}
             onCenter={handleCenterSelected}
             onCollapsedChange={setDetailCollapsed}
           />
@@ -223,18 +320,30 @@ export default function App() {
           <LayerToggles layers={layers} onChange={setLayers} />
         </div>
 
-        {connected && positionCount === 0 && (
+        {mode === "live" && (
+          <div className="ops-overlay ops-overlay--bottom-left">
+            <EventFeed events={alerts} onSelectMmsi={setSelectedMmsi} />
+          </div>
+        )}
+
+        {connected && mode === "replay" && positionCount === 0 && (
           <div className="empty-banner">
             <strong>No contacts in area of interest</strong>
             Load corridor traffic:
             <code>python scripts/load_live_ais.py --clear</code>
-            Or record tracks over time:
-            <code>python scripts/record_ais.py --to-db --clear --interval 300</code>
+            Or switch to live mode for AISStream ingest.
+          </div>
+        )}
+
+        {connected && mode === "live" && !aisConnected && (
+          <div className="empty-banner">
+            <strong>AISStream not connected</strong>
+            Set <code>AISSTREAM_API_KEY</code> in the backend environment and restart.
           </div>
         )}
       </div>
 
-      {scenario && (
+      {mode === "replay" && scenario && (
         <TimelineDock
           playing={playing}
           current={current || scenario.end}

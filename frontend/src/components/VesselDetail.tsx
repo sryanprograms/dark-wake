@@ -1,14 +1,30 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Anchor, Crosshair } from "lucide-react";
 import type { VesselPoint } from "../map/MapView";
-import { formatUtc } from "../utils/time";
+import { formatUtc, formatUtcShort } from "../utils/time";
+import type { AlertEvent } from "../ws/live";
 import { CollapsiblePanel } from "./CollapsiblePanel";
 
 type VesselDetailProps = {
   vessel: VesselPoint | null;
+  alerts?: AlertEvent[];
   onCenter?: () => void;
   onCollapsedChange?: (collapsed: boolean) => void;
 };
+
+function isAisSilenceAlert(alert: AlertEvent): boolean {
+  return (
+    alert.kind === "ais_silent" ||
+    alert.kind === "ais_gap_resume" ||
+    alert.kind === "ais_gap"
+  );
+}
+
+function alertSeverityClass(severity: string): string {
+  if (severity === "high") return "detail-panel__alert--high";
+  if (severity === "medium") return "detail-panel__alert--medium";
+  return "detail-panel__alert--low";
+}
 
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
@@ -19,8 +35,13 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function VesselDetail({ vessel, onCenter, onCollapsedChange }: VesselDetailProps) {
+export function VesselDetail({ vessel, alerts = [], onCenter, onCollapsedChange }: VesselDetailProps) {
   const [collapsed, setCollapsed] = useState(!vessel);
+
+  const vesselAlerts = useMemo(() => {
+    if (!vessel) return [];
+    return alerts.filter((alert) => alert.mmsi === vessel.mmsi && isAisSilenceAlert(alert));
+  }, [alerts, vessel]);
 
   useEffect(() => {
     if (vessel) {
@@ -102,10 +123,28 @@ export function VesselDetail({ vessel, onCenter, onCollapsedChange }: VesselDeta
                   <div className="detail-panel__alerts-header">
                     <AlertTriangle size={14} />
                     <span>Alerts</span>
+                    {vesselAlerts.length > 0 ? (
+                      <span className="detail-panel__alerts-count">{vesselAlerts.length}</span>
+                    ) : null}
                   </div>
-                  <p className="detail-panel__alerts-empty">
-                    No anomalies detected. Dark-ship fusion arrives in Phase 2.
-                  </p>
+                  {vesselAlerts.length === 0 ? (
+                    <p className="detail-panel__alerts-empty">No AIS silence alerts for this contact.</p>
+                  ) : (
+                    <ul className="detail-panel__alert-list">
+                      {vesselAlerts.map((alert, index) => (
+                        <li
+                          key={`${alert.id ?? alert.t}-${index}`}
+                          className={`detail-panel__alert ${alertSeverityClass(alert.severity)}`}
+                        >
+                          <div className="detail-panel__alert-title">{alert.title}</div>
+                          <div className="detail-panel__alert-meta">{formatUtcShort(alert.t)}</div>
+                          {alert.reason ? (
+                            <div className="detail-panel__alert-reason">{alert.reason}</div>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               </>
             );

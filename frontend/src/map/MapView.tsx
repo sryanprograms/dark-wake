@@ -34,9 +34,18 @@ export type VesselTrack = {
   path: [number, number][];
 };
 
+export type SarDetection = {
+  id: string;
+  lat: number;
+  lon: number;
+  t?: string;
+  length_m?: number | null;
+};
+
 type MapViewProps = {
   vessels: VesselPoint[];
   tracks: VesselTrack[];
+  sarDetections?: SarDetection[];
   bbox?: {
     min_lat: number;
     max_lat: number;
@@ -55,6 +64,18 @@ const DEFAULT_ZOOM = 7;
 
 const DARK_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 
+function getMapCursor({
+  isDragging,
+  isHovering,
+}: {
+  isDragging: boolean;
+  isHovering: boolean;
+}): string {
+  if (isDragging) return "grabbing";
+  if (isHovering) return "pointer";
+  return "grab";
+}
+
 function VesselTooltip({ vessel, x, y }: { vessel: VesselPoint; x: number; y: number }) {
   return (
     <div className="vessel-tooltip" style={{ left: x, top: y }}>
@@ -68,10 +89,21 @@ function VesselTooltip({ vessel, x, y }: { vessel: VesselPoint; x: number; y: nu
 }
 
 function CableTooltip({ cable, x, y }: { cable: CableSegment; x: number; y: number }) {
+  const statusLabel = cable.status === "planned" ? "Planned" : "In service";
+  const landing =
+    cable.landing_points && cable.landing_points.length > 0
+      ? cable.landing_points.map((lp) => lp.name).join(" · ")
+      : null;
+
   return (
     <div className="vessel-tooltip" style={{ left: x, top: y }}>
       <strong>{cable.name}</strong>
-      <div>Submarine cable</div>
+      <div>Submarine telecom · {statusLabel}</div>
+      {cable.length && <div>{cable.length}</div>}
+      {cable.owners && <div>Owner: {cable.owners}</div>}
+      {cable.suppliers && <div>Supplier: {cable.suppliers}</div>}
+      {cable.rfs && <div>RFS: {cable.rfs}</div>}
+      {landing && <div>Landing: {landing}</div>}
     </div>
   );
 }
@@ -90,6 +122,7 @@ function bboxPath(bbox: NonNullable<MapViewProps["bbox"]>): [number, number][] {
 export function MapView({
   vessels,
   tracks,
+  sarDetections = [],
   bbox,
   cables = [],
   selectedMmsi,
@@ -130,7 +163,7 @@ export function MapView({
       attributionControl: false,
     });
 
-    const overlay = new MapboxOverlay({ interleaved: true });
+    const overlay = new MapboxOverlay({ interleaved: true, getCursor: getMapCursor });
     map.addControl(overlay as unknown as maplibregl.IControl);
     map.on("load", () => setReady(true));
     map.on("mousemove", (e) => setCursor({ lat: e.lngLat.lat, lon: e.lngLat.lng }));
@@ -215,6 +248,25 @@ export function MapView({
       );
     }
 
+    if (layers.sar && sarDetections.length > 0) {
+      deckLayers.push(
+        new ScatterplotLayer<SarDetection>({
+          id: "sar-detections",
+          data: sarDetections,
+          getPosition: (d) => [d.lon, d.lat],
+          getRadius: 500,
+          radiusMinPixels: 6,
+          radiusMaxPixels: 14,
+          getFillColor: [255, 120, 80, 200],
+          getLineColor: [255, 200, 120, 255],
+          lineWidthMinPixels: 1,
+          stroked: true,
+          filled: true,
+          pickable: false,
+        }),
+      );
+    }
+
     if (layers.vessels) {
       if (selectedVessel) {
         deckLayers.push(
@@ -266,11 +318,12 @@ export function MapView({
       );
     }
 
-    overlayRef.current.setProps({ layers: deckLayers });
+    overlayRef.current.setProps({ layers: deckLayers, getCursor: getMapCursor });
   }, [
     ready,
     vessels,
     tracks,
+    sarDetections,
     iconAtlas,
     bbox,
     cables,
@@ -288,6 +341,14 @@ export function MapView({
       duration: 600,
     });
   }, [centerRequest]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const canvas = map.getCanvas();
+    const hovering = hover !== null || cableHover !== null;
+    canvas.style.cursor = hovering ? "pointer" : "";
+  }, [hover, cableHover, ready]);
 
   return (
     <div className="map-container" ref={containerRef}>

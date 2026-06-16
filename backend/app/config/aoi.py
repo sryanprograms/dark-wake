@@ -39,6 +39,11 @@ def bbox_polygon_coords() -> list[list[float]]:
     return _ring(BBOX["min_lon"], BBOX["min_lat"], BBOX["max_lon"], BBOX["max_lat"])
 
 
+def aisstream_bounding_boxes() -> list[list[list[float]]]:
+    """AISStream subscription format: [[[min_lat, min_lon], [max_lat, max_lon]]]."""
+    return [[[BBOX["min_lat"], BBOX["min_lon"]], [BBOX["max_lat"], BBOX["max_lon"]]]]
+
+
 def gfw_query_polygon_coords() -> list[list[float]]:
     """GeoJSON polygon for GFW SAR pulls; results are filtered back to BBOX."""
     return _ring(

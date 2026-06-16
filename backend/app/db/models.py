@@ -6,6 +6,7 @@ from datetime import datetime
 
 from geoalchemy2 import Geometry
 from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -38,3 +39,19 @@ class AisPosition(Base):
     cog: Mapped[float | None] = mapped_column(Float)
     heading: Mapped[float | None] = mapped_column(Float)
     nav_status: Mapped[str | None] = mapped_column(Text)
+
+
+class OperatorEvent(Base):
+    __tablename__ = "operator_event"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    severity: Mapped[str] = mapped_column(Text, nullable=False)
+    mmsi: Mapped[int | None] = mapped_column(BigInteger)
+    t: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    geom = mapped_column(Geometry("POINT", srid=4326))
+    track_excerpt: Mapped[list | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

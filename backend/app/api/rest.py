@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 
 from app.config.aoi import AOI_NAME, BBOX, DEFAULT_END, DEFAULT_START
-from app.db.models import AisPosition, Vessel
+from app.db.models import AisPosition, OperatorEvent, Vessel
 from app.db.session import get_db
 from app.ingest.cables import fetch_cables_in_bbox
 from app.config.thresholds import REPLAY_DEFAULT_WINDOW_PRESET
@@ -142,5 +142,39 @@ async def vessel_track(
                 "heading": r.heading,
             }
             for r in rows
+        ],
+    }
+
+
+@router.get("/events")
+async def list_operator_events(
+    limit: int = Query(default=50, ge=1, le=500),
+    kind: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db),
+) -> dict:
+    query = (
+        select(OperatorEvent)
+        .order_by(OperatorEvent.t.desc())
+        .limit(limit)
+    )
+    if kind:
+        query = query.where(OperatorEvent.kind == kind)
+
+    rows = (await session.execute(query)).scalars().all()
+    return {
+        "count": len(rows),
+        "events": [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "severity": row.severity,
+                "mmsi": row.mmsi,
+                "t": row.t.astimezone(timezone.utc).isoformat(),
+                "title": row.title,
+                "reason": row.reason,
+                "details": row.details,
+                "track_excerpt": row.track_excerpt,
+            }
+            for row in rows
         ],
     }
