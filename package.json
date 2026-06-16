@@ -1,0 +1,11 @@
+{
+  "name": "darkwake",
+  "private": true,
+  "scripts": {
+  "setup": "bash scripts/setup_local.sh",
+  "build": "npm run build --prefix frontend",
+  "dev": "npm run dev --prefix frontend",
+  "load:live": "python scripts/load_live_ais.py --clear",
+  "install:frontend": "npm install --prefix frontend"
+  }
+}

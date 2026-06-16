@@ -9,6 +9,8 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.ingest.vessel_meta import country_from_mmsi, flag_from_mmsi, ship_type_label
+
 DMA_COLUMNS = {
     "timestamp": "Timestamp",
     "mmsi": "MMSI",
@@ -18,6 +20,7 @@ DMA_COLUMNS = {
     "cog": "COG",
     "heading": "Heading",
     "name": "Name",
+    "ship_type": "Ship type",
 }
 
 
@@ -84,6 +87,8 @@ def normalize_dma_row(row: dict[str, str]) -> dict[str, Any] | None:
     ts_raw = row.get(DMA_COLUMNS["timestamp"])
     if lat is None or lon is None or mmsi is None or not ts_raw:
         return None
+    ship_type_raw = (row.get(DMA_COLUMNS["ship_type"]) or "").strip()
+    ship_type = ship_type_label(ship_type_raw) if ship_type_raw else None
     return {
         "mmsi": mmsi,
         "t": _parse_dma_timestamp(ts_raw).isoformat(),
@@ -93,6 +98,9 @@ def normalize_dma_row(row: dict[str, str]) -> dict[str, Any] | None:
         "cog": _parse_float(row.get(DMA_COLUMNS["cog"])),
         "heading": _parse_float(row.get(DMA_COLUMNS["heading"])),
         "name": (row.get(DMA_COLUMNS["name"]) or "").strip() or None,
+        "ship_type": ship_type,
+        "flag": flag_from_mmsi(mmsi),
+        "country": country_from_mmsi(mmsi),
     }
 
 
@@ -170,6 +178,8 @@ def normalize_digitraffic_feature(
         "cog": _parse_float(props.get("cog")),
         "heading": _parse_float(props.get("heading")),
         "name": (props.get("name") or "").strip() or None,
+        "flag": flag_from_mmsi(mmsi),
+        "country": country_from_mmsi(mmsi),
     }
 
 
@@ -219,22 +229,11 @@ def load_positions_from_json(
     bbox: dict[str, float],
     start: datetime | None = None,
     end: datetime | None = None,
+    live: bool = False,
 ) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    positions: list[dict[str, Any]] = []
+    from app.ingest.json_loader import load_positions_from_json as _load
 
-    if isinstance(payload, list):
-        for item in payload:
-            if "mmsi" in item and "lat" in item:
-                positions.append(item)
-    elif isinstance(payload, dict):
-        if payload.get("type") == "FeatureCollection" or "features" in payload:
-            for feature in payload.get("features", []):
-                pos = normalize_digitraffic_feature(feature)
-                if pos:
-                    positions.append(pos)
-
-    return filter_positions(positions, bbox, start, end)
+    return _load(path, bbox=bbox, start=start, end=end, live=live)
 
 
 def parse_dma_csv_text(

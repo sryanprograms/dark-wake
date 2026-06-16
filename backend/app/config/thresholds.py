@@ -1,5 +1,7 @@
 """Tunable fusion and behavioral thresholds (spec §8–§9). Not used in Phase 0 logic."""
 
+from datetime import timedelta
+
 # Fusion (spec §8)
 SAR_MATCH_RADIUS_M = 750
 SAR_MATCH_TIME_WINDOW_S = 600
@@ -15,6 +17,13 @@ DRAG_SOG_MIN_KN = 0.5
 DRAG_SOG_MAX_KN = 5.0
 DRAG_MIN_TRACK_KM = 10
 
-# Phase 0 overlap spike (looser than fusion; proves co-existence, not matching)
+# Phase 1 replay (simulated seconds advanced per wall-clock tick)
+REPLAY_SIM_SECONDS_PER_TICK = 3600  # 1 h — sparse historical AIS demos
+REPLAY_DEFAULT_WINDOW_PRESET = "24h"
+REPLAY_WINDOW_PRESETS: dict[str, timedelta] = {
+    "24h": timedelta(hours=24),
+    "3d": timedelta(days=3),
+    "7d": timedelta(days=7),
+}
 OVERLAP_TIME_MARGIN_S = 86400  # 24 h — Digitraffic timestampExternal is sparse
 OVERLAP_MIN_AIS_POSITIONS = 1

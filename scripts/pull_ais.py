@@ -22,11 +22,10 @@ from app.ingest.ais_csv import (  # noqa: E402
     filter_positions,
     load_positions_from_csv,
     load_positions_from_json,
-    normalize_digitraffic_feature,
     parse_dma_csv_text,
 )
+from app.ingest.digitraffic import fetch_digitraffic_positions  # noqa: E402
 
-DIGITRAFFIC_LOCATIONS_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
 DMA_ZIP_URL = "https://web.ais.dk/aisdata/aisdk-{date}.zip"
 
 
@@ -45,25 +44,16 @@ def pull_digitraffic(
     end: datetime | None,
     live_snapshot: bool = False,
 ) -> list[dict]:
-    headers = {
-        "Accept-Encoding": "gzip",
-        "Digitraffic-User": user_agent,
-    }
-    response = client.get(DIGITRAFFIC_LOCATIONS_URL, headers=headers, timeout=60.0)
-    response.raise_for_status()
-    payload = response.json()
-    snapshot_time = datetime.now(timezone.utc) if live_snapshot else None
-    positions = []
-    for feature in payload.get("features", []):
-        pos = normalize_digitraffic_feature(
-            feature,
-            default_time=snapshot_time,
-        )
-        if pos:
-            positions.append(pos)
-    if live_snapshot:
-        return filter_positions(positions, bbox, start=None, end=None)
-    return filter_positions(positions, bbox, start, end)
+    return fetch_digitraffic_positions(
+        client,
+        user_agent=user_agent,
+        bbox=bbox,
+        start=start,
+        end=end,
+        live_snapshot=live_snapshot,
+    )
+
+from app.ingest.digitraffic import fetch_digitraffic_positions  # noqa: E402
 
 
 def pull_dma_day(

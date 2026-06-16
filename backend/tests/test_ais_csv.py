@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 from app.ingest.ais_csv import (
+    load_positions_from_json,
     normalize_baltic_row,
     normalize_dma_row,
     normalize_digitraffic_feature,
@@ -76,3 +77,20 @@ def test_parse_dma_csv_text_filters_to_bbox_and_window():
     positions = parse_dma_csv_text(csv_text, BBOX, start, end)
     assert len(positions) == 1
     assert positions[0]["mmsi"] == 111111111
+
+
+def test_load_positions_from_json_pull_ais_wrapper(tmp_path):
+    path = tmp_path / "ais.json"
+    path.write_text(
+        """{
+          "positions": [
+            {"mmsi": 123, "t": "2022-06-17T04:00:00Z", "lat": 59.5, "lon": 24.0}
+          ]
+        }""",
+        encoding="utf-8",
+    )
+    start = datetime(2022, 6, 1, tzinfo=timezone.utc)
+    end = datetime(2022, 6, 30, tzinfo=timezone.utc)
+    positions = load_positions_from_json(path, bbox=BBOX, start=start, end=end)
+    assert len(positions) == 1
+    assert positions[0]["mmsi"] == 123

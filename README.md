@@ -40,9 +40,11 @@ flowchart LR
 
 
 
-**Phase 0 (current)** validates that both data sources overlap for a chosen area and time window — the hard prerequisite before any fusion logic ships.
+**Phase 0 (complete)** validated that both data sources overlap for the chosen area and time window.
 
-**Phases 1–5** add replay visualization, gap detection, SAR matching, re-identification, and cable-proximity behavioral rules. See [Roadmap](#roadmap) below.
+**Phase 1 (in progress)** adds replay visualization — AIS vessels on a map with play/pause/scrub controls. No fusion yet.
+
+**Phases 2–5** add gap detection, SAR matching, re-identification, and cable-proximity behavioral rules.
 
 ---
 
@@ -73,7 +75,7 @@ An alternate high-impact AOI (Strait of Hormuz) is documented in the spec for a 
 | Map        | deck.gl + MapLibre GL JS  | Vessel tracks, SAR layer, dark contacts *(Phase 1+)* |
 
 
-Phase 0 is intentionally lean: `httpx`, `python-dotenv`, and pytest — no database or frontend yet.
+Phase 0 used `httpx`, `python-dotenv`, and pytest only. Phase 1 adds PostGIS, FastAPI, and the React map stack.
 
 ---
 
@@ -83,14 +85,20 @@ Phase 0 is intentionally lean: `httpx`, `python-dotenv`, and pytest — no datab
 backend/
   app/
     config/       AOI bbox, thresholds, settings
-    ingest/       AIS CSV + GFW SAR pull logic
-    spike_overlap.py   Phase 0 overlap gate
-  tests/          pytest fixtures for ingest + spike
+    db/           PostGIS models + migrations
+    ingest/       AIS CSV + GFW SAR pull + DB loader
+    replay/       Replay clock + DB position source
+    api/          REST + WebSocket handlers
+    main.py       FastAPI entry
+  tests/          pytest fixtures
 scripts/
   pull_ais.py     AIS data pull CLI
   pull_sar.py     GFW SAR pull CLI
+  load_ais.py       Load AIS JSON into PostGIS
+  load_live_ais.py  Pull + load live Digitraffic snapshot (~600+ vessels)
+  record_ais.py     Poll Digitraffic to build replayable tracks
   spike_overlap.py   Overlap check CLI
-frontend/         Map UI (Phase 1)
+frontend/         React + deck.gl map UI
 data/             Runtime pulls (gitignored)
 docs/             Design spec and build plans
 ```
@@ -104,25 +112,97 @@ docs/             Design spec and build plans
 
 ---
 
+## Prerequisites
+
+You need **one** of these database options:
+
+| Option | Install |
+|--------|---------|
+| **A — Local (no Docker)** | Run `npm run setup` once (installs Homebrew **PostgreSQL 17** + PostGIS) |
+| **B — Docker** | Install [Docker Desktop for Mac](https://www.docker.com/products/docker-desktop/), then `docker compose up --build` |
+
+You also need **Node.js 18+** (`node -v`) and **Python 3.11+** (`python3 --version`).
+
+---
+
 ## Setup
 
-From the repo root (use **one** venv here — scripts expect it):
+From the repo root:
 
 ```bash
-python3 -m venv .venv
+npm run setup
 source .venv/bin/activate
-pip install -e ".[dev]"
-pip install -e "./backend[dev]"
-cp .env.example .env   # add GFW_API_TOKEN=
+cp .env.example .env   # if setup didn't already; add GFW_API_TOKEN=
 ```
 
-Then run the Phase 0 gate:
+`npm run setup` creates the Python venv, installs backend + frontend deps, and if Docker is missing it installs **PostgreSQL 16 + PostGIS via Homebrew** and runs the DB migration.
+
+If setup fails at "Starting PostgreSQL" or PostGIS extension errors, the brew packages may still be installed. Homebrew **postgis only supports PostgreSQL 17/18** (not 16). Finish with:
+
+```bash
+brew install postgresql@17
+brew services stop postgresql@16   # if an older server is still running
+bash scripts/finish_db_setup.sh
+```
+
+Phase 0 gate (optional):
 
 ```bash
 python scripts/run_phase0_gate.py
 ```
 
-If you see `ModuleNotFoundError: No module named 'dotenv'`, the venv is missing deps — run the `pip install` lines above.
+---
+
+## Phase 1 quickstart
+
+**Terminal 1 — backend**
+
+```bash
+source .venv/bin/activate
+bash scripts/start_backend.sh
+```
+
+**Terminal 2 — map UI**
+
+```bash
+npm run dev
+```
+
+Open http://localhost:5173 — press **Play** to replay vessels.
+
+**Load AIS data** (once, after backend DB is up):
+
+```bash
+# Dense live corridor traffic (~600+ vessels) — recommended for Phase 1 demo
+python scripts/load_live_ais.py --clear
+
+# Or record tracks over time for replay / Phase 2 gap detection
+python scripts/record_ais.py --to-db --clear --interval 300
+# Let it run 30–60+ min, then replay
+```
+
+Historical Phase 0 pull (sparse, SAR-aligned window only):
+
+```bash
+python scripts/pull_ais.py --source digitraffic
+python scripts/load_ais.py data/ais_*.json --clear --live
+```
+
+### With Docker (if installed)
+
+```bash
+docker compose up --build
+# then in another terminal:
+npm run dev
+```
+
+### Build frontend only
+
+```bash
+npm run build
+```
+
+Output lands in `frontend/dist/`.
 
 ---
 
