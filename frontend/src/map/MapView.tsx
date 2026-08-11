@@ -14,6 +14,7 @@ import {
 import type { CableSegment } from "../api/cables";
 import type { LayerVisibility } from "../types/layers";
 import { formatUtcShort } from "../utils/time";
+import type { SceneContact } from "../ws/timeline";
 
 export type VesselPoint = {
   mmsi: number;
@@ -42,10 +43,17 @@ export type SarDetection = {
   length_m?: number | null;
 };
 
+type ContactConnector = {
+  id: string;
+  path: [number, number][];
+  kind: SceneContact["kind"];
+};
+
 type MapViewProps = {
   vessels: VesselPoint[];
   tracks: VesselTrack[];
   sarDetections?: SarDetection[];
+  contacts?: SceneContact[];
   bbox?: {
     min_lat: number;
     max_lat: number;
@@ -59,7 +67,7 @@ type MapViewProps = {
   centerRequest?: { lat: number; lon: number; token: number } | null;
 };
 
-const DEFAULT_CENTER: [number, number] = [25.0, 59.8];
+const DEFAULT_CENTER: [number, number] = [11.7, 55.8];
 const DEFAULT_ZOOM = 7;
 
 const DARK_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
@@ -123,6 +131,7 @@ export function MapView({
   vessels,
   tracks,
   sarDetections = [],
+  contacts = [],
   bbox,
   cables = [],
   selectedMmsi,
@@ -146,6 +155,31 @@ export function MapView({
   const [cursor, setCursor] = useState<{ lat: number; lon: number } | null>(null);
 
   const iconAtlas = useMemo(() => getArrowIconAtlas(), []);
+
+  const contactConnectors = useMemo<ContactConnector[]>(
+    () =>
+      contacts
+        .filter(
+          (contact) =>
+            contact.ais_lat != null &&
+            contact.ais_lon != null &&
+            (contact.kind === "matched" || contact.kind === "ambiguous"),
+        )
+        .map((contact) => ({
+          id: contact.id,
+          kind: contact.kind,
+          path: [
+            [contact.sar_lon, contact.sar_lat],
+            [contact.ais_lon!, contact.ais_lat!],
+          ],
+        })),
+    [contacts],
+  );
+
+  const darkContacts = useMemo(
+    () => contacts.filter((contact) => contact.kind === "dark"),
+    [contacts],
+  );
 
   const selectedVessel = useMemo(
     () => vessels.find((v) => v.mmsi === selectedMmsi) ?? null,
@@ -267,6 +301,43 @@ export function MapView({
       );
     }
 
+    if (contactConnectors.length > 0) {
+      deckLayers.push(
+        new PathLayer<ContactConnector>({
+          id: "scene-contact-connectors",
+          data: contactConnectors,
+          getPath: (d) => d.path,
+          getColor: (d) =>
+            d.kind === "matched" ? [78, 205, 196, 200] : [255, 200, 80, 180],
+          getWidth: 2,
+          widthMinPixels: 1,
+          widthMaxPixels: 4,
+          capRounded: true,
+          jointRounded: true,
+          pickable: false,
+        }),
+      );
+    }
+
+    if (darkContacts.length > 0) {
+      deckLayers.push(
+        new ScatterplotLayer<SceneContact>({
+          id: "scene-dark-contacts",
+          data: darkContacts,
+          getPosition: (d) => [d.sar_lon, d.sar_lat],
+          getRadius: 600,
+          radiusMinPixels: 8,
+          radiusMaxPixels: 18,
+          getFillColor: [255, 60, 100, 230],
+          getLineColor: [255, 180, 200, 255],
+          lineWidthMinPixels: 2,
+          stroked: true,
+          filled: true,
+          pickable: false,
+        }),
+      );
+    }
+
     if (layers.vessels) {
       if (selectedVessel) {
         deckLayers.push(
@@ -324,6 +395,8 @@ export function MapView({
     vessels,
     tracks,
     sarDetections,
+    contactConnectors,
+    darkContacts,
     iconAtlas,
     bbox,
     cables,

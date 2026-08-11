@@ -1,34 +1,37 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { fetchTimelineBounds, fetchTimelineScenes } from "./api/timeline";
 import { fetchCables, type CableSegment } from "./api/cables";
 import { EventFeed } from "./components/EventFeed";
 import { FleetPanel } from "./components/FleetPanel";
 import { LayerToggles } from "./components/LayerToggles";
+import { MapLegend } from "./components/MapLegend";
+import { SceneContactFeed } from "./components/SceneContactFeed";
 import { TimelineDock } from "./components/TimelineDock";
 import { TopBar } from "./components/TopBar";
 import { VesselDetail } from "./components/VesselDetail";
-import { MapView, VesselPoint, VesselTrack, type SarDetection } from "./map/MapView";
+import { MapView, VesselPoint, VesselTrack } from "./map/MapView";
 import { DEFAULT_LAYERS, LayerVisibility } from "./types/layers";
-import { filterVesselsByShipType } from "./utils/shipTypes";
-import { filterVesselsByNation } from "./utils/nations";
+import { countAttentionAlerts } from "./utils/alerts";
+import { filterVessels } from "./utils/vesselFilters";
+import { normalizeSceneContacts } from "./utils/sceneContacts";
+import { emptyMapCopy, resolveEmptyMapState } from "./utils/timelineCoverage";
 import { toMs } from "./utils/time";
 import {
   AlertEvent,
-  connectLive,
-  LiveMessage,
-  LiveStateEvent,
-} from "./ws/live";
-import { AisEvent, connectReplay, ReplayMessage, WindowPreset } from "./ws/replay";
+  AisEvent,
+  connectTimeline,
+  PlayheadMode,
+  SceneContact,
+  TimelineMessage,
+  TimelineScene,
+} from "./ws/timeline";
 
-type AppMode = "live" | "replay";
-
-type Scenario = {
+type Corridor = {
   id: string;
   name: string;
-  start: string;
-  end: string;
   dataStart: string;
   dataEnd: string;
-  windowPreset: WindowPreset;
+  liveEdge: string;
   bbox: {
     min_lat: number;
     max_lat: number;
@@ -37,11 +40,20 @@ type Scenario = {
   };
 };
 
-const WINDOW_PRESETS: WindowPreset[] = ["24h", "3d", "7d"];
+import { DEFAULT_BBOX, LIVE_EDGE_MS } from "./constants/timeline";
 
-function getInitialMode(): AppMode {
-  const params = new URLSearchParams(window.location.search);
-  return params.get("mode") === "replay" ? "replay" : "live";
+function defaultCorridor(): Corridor {
+  const now = new Date();
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 3_600_000);
+  const iso = now.toISOString();
+  return {
+    id: "timeline",
+    name: "Danish Belt",
+    dataStart: weekAgo.toISOString(),
+    dataEnd: iso,
+    liveEdge: iso,
+    bbox: DEFAULT_BBOX,
+  };
 }
 
 function wsBaseUrl(): string {
@@ -72,35 +84,29 @@ function vesselsFromBatch(vessels: Omit<AisEvent, "type">[]): Map<number, Vessel
   return new Map(vessels.map((v) => [v.mmsi, aisToVessel(v)]));
 }
 
-function liveStateToScenario(msg: LiveStateEvent): Scenario {
-  const now = msg.current;
-  return {
-    id: msg.id,
-    name: msg.name,
-    start: now,
-    end: now,
-    dataStart: now,
-    dataEnd: now,
-    windowPreset: "24h",
-    bbox: msg.bbox,
-  };
-}
-
 export default function App() {
-  const [mode, setMode] = useState<AppMode>(getInitialMode);
-  const clientRef = useRef<ReturnType<typeof connectReplay> | ReturnType<typeof connectLive> | null>(null);
+  const clientRef = useRef<ReturnType<typeof connectTimeline> | null>(null);
+  const playheadModeRef = useRef<PlayheadMode>("live");
+  const lastAisAtRef = useRef(0);
   const [vessels, setVessels] = useState<Map<number, VesselPoint>>(new Map());
   const [tracks, setTracks] = useState<VesselTrack[]>([]);
-  const [sarDetections, setSarDetections] = useState<SarDetection[]>([]);
+  const [sarDetections, setSarDetections] = useState<
+    { id: string; lat: number; lon: number; t?: string; length_m?: number | null }[]
+  >([]);
+  const [contacts, setContacts] = useState<SceneContact[]>([]);
   const [alerts, setAlerts] = useState<AlertEvent[]>([]);
-  const [scenario, setScenario] = useState<Scenario | null>(null);
+  const [corridor, setCorridor] = useState<Corridor | null>(defaultCorridor);
+  const [playheadMode, setPlayheadMode] = useState<PlayheadMode>("live");
+  const [scenes, setScenes] = useState<TimelineScene[]>([]);
+  const [currentSceneId, setCurrentSceneId] = useState<string | null>(null);
   const [current, setCurrent] = useState("");
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(2);
-  const [windowPreset, setWindowPreset] = useState<WindowPreset>("24h");
   const [connected, setConnected] = useState(false);
   const [aisConnected, setAisConnected] = useState(false);
+  const [aisReceiving, setAisReceiving] = useState(false);
   const [positionCount, setPositionCount] = useState<number | null>(null);
+  const [sceneCount, setSceneCount] = useState<number | null>(null);
   const [selectedMmsi, setSelectedMmsi] = useState<number | null>(null);
   const [centerRequest, setCenterRequest] = useState<{
     lat: number;
@@ -113,8 +119,11 @@ export default function App() {
   const [detailCollapsed, setDetailCollapsed] = useState(true);
   const [shipTypeFilter, setShipTypeFilter] = useState<Set<string>>(() => new Set());
   const [nationFilter, setNationFilter] = useState<Set<string>>(() => new Set());
+  const [searchQuery, setSearchQuery] = useState("");
+  const [movingOnly, setMovingOnly] = useState(false);
 
   const applyAis = useCallback((msg: AisEvent | Omit<AisEvent, "type">) => {
+    if (playheadModeRef.current === "scene") return;
     setVessels((prev) => {
       const next = new Map(prev);
       next.set(msg.mmsi, aisToVessel(msg));
@@ -122,20 +131,62 @@ export default function App() {
     });
   }, []);
 
-  const switchMode = useCallback((next: AppMode) => {
-    const url = new URL(window.location.href);
-    if (next === "replay") {
-      url.searchParams.set("mode", "replay");
-    } else {
-      url.searchParams.delete("mode");
+  useEffect(() => {
+    playheadModeRef.current = playheadMode;
+  }, [playheadMode]);
+
+  useEffect(() => {
+    if (playheadMode !== "live" || !connected) {
+      setAisReceiving(false);
+      return;
     }
-    window.history.replaceState({}, "", url);
-    setMode(next);
+    const id = window.setInterval(() => {
+      setAisReceiving(Date.now() - lastAisAtRef.current < 60_000);
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [playheadMode, connected]);
+
+  useEffect(() => {
+    if (playheadMode !== "live" || !connected) return;
+    const id = window.setInterval(() => {
+      setCurrent(new Date().toISOString());
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [playheadMode, connected]);
+
+  const clearSceneOverlay = useCallback(() => {
+    setSarDetections([]);
+    setContacts([]);
+    setCurrentSceneId(null);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    fetchCables(scenario?.bbox)
+    Promise.all([fetchTimelineBounds(), fetchTimelineScenes()]).then(([bounds, sceneList]) => {
+      if (cancelled) return;
+      if (sceneList.length > 0) setScenes(sceneList);
+      if (bounds) {
+        setPositionCount(bounds.ais_count ?? null);
+        setSceneCount(bounds.scene_count ?? null);
+        setCorridor((prev) => ({
+          id: "timeline",
+          name: prev?.name ?? "Danish Belt",
+          dataStart: bounds.data_start ?? prev?.dataStart ?? bounds.live_edge,
+          dataEnd: bounds.data_end ?? prev?.dataEnd ?? bounds.live_edge,
+          liveEdge: bounds.live_edge,
+          bbox: prev?.bbox ?? DEFAULT_BBOX,
+        }));
+        setCurrent((prev) => prev || bounds.live_edge);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchCables(corridor?.bbox)
       .then((segments) => {
         if (!cancelled) setCables(segments);
       })
@@ -145,106 +196,123 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [scenario?.bbox]);
+  }, [corridor?.bbox]);
 
   useEffect(() => {
     clientRef.current?.close();
     setConnected(false);
     setVessels(new Map());
     setTracks([]);
-    setSarDetections([]);
+    clearSceneOverlay();
     setAlerts([]);
     setSelectedMmsi(null);
     setPlaying(false);
 
-    if (mode === "live") {
-      const client = connectLive(`${wsBaseUrl()}/ws/live`, (msg: LiveMessage) => {
-        if (msg.type === "live_state") {
-          setScenario(liveStateToScenario(msg));
-          setCurrent(msg.current);
-          setPositionCount(msg.vessel_count);
-          setAisConnected(msg.ais_connected);
-          setConnected(true);
-        } else if (msg.type === "ais_batch") {
-          setVessels(vesselsFromBatch(msg.vessels));
-        } else if (msg.type === "tracks_batch") {
-          setTracks(msg.tracks);
-        } else if (msg.type === "ais") {
-          applyAis(msg);
-          setCurrent(msg.t);
-        } else if (msg.type === "sar_batch") {
-          setSarDetections((prev) => {
-            const byId = new Map(prev.map((d) => [d.id, d]));
-            for (const det of msg.detections) {
-              byId.set(det.id, det);
-            }
-            return Array.from(byId.values());
-          });
-        } else if (msg.type === "alert") {
-          setAlerts((prev) => [msg, ...prev].slice(0, 100));
+    const client = connectTimeline(`${wsBaseUrl()}/ws/timeline`, (msg: TimelineMessage) => {
+      if (msg.type === "timeline_state") {
+        setPlayheadMode(msg.mode);
+        setCurrent(msg.current ?? msg.playhead ?? "");
+        setPlaying(msg.playing ?? false);
+        if (msg.speed != null) setSpeed(msg.speed);
+        if (msg.scenes?.length) {
+          setScenes(msg.scenes);
+          setSceneCount(msg.scenes.length);
         }
-      });
-      clientRef.current = client;
-      return () => client.close();
-    }
-
-    const client = connectReplay(`${wsBaseUrl()}/ws/replay`, (msg: ReplayMessage) => {
-      if (msg.type === "scenario") {
-        setScenario({
-          id: msg.id,
-          name: msg.name,
-          start: msg.start,
-          end: msg.end,
+        setCurrentSceneId(msg.current_scene_id ?? null);
+        setPositionCount(msg.position_count ?? msg.vessel_count ?? null);
+        setAisConnected(msg.ais_connected ?? false);
+        setConnected(true);
+        setCorridor({
+          id: msg.id ?? "timeline",
+          name: msg.name ?? "Danish Belt",
           dataStart: msg.data_start,
           dataEnd: msg.data_end,
-          windowPreset: msg.window_preset,
-          bbox: msg.bbox,
+          liveEdge: msg.live_edge,
+          bbox: msg.bbox ?? DEFAULT_BBOX,
         });
-        setWindowPreset(msg.window_preset);
-        setCurrent(msg.current ?? msg.end);
-        setPositionCount(msg.position_count ?? null);
-        setConnected(true);
-        setPlaying(false);
-        setVessels(new Map());
-        setTracks([]);
-        setSelectedMmsi(null);
-        setShipTypeFilter(new Set());
-        setNationFilter(new Set());
-        clientRef.current?.send({ action: "speed", multiplier: speed });
+        if (msg.mode !== "scene") clearSceneOverlay();
       } else if (msg.type === "state") {
         setCurrent(msg.current);
         setPlaying(msg.playing);
+        if (msg.mode) {
+          setPlayheadMode(msg.mode);
+          if (msg.mode !== "scene") clearSceneOverlay();
+        }
+        if (msg.current_scene_id !== undefined) {
+          setCurrentSceneId(msg.current_scene_id);
+        }
       } else if (msg.type === "ais_batch") {
-        setVessels(vesselsFromBatch(msg.vessels));
+        if (playheadModeRef.current !== "scene") {
+          if (msg.source !== "db_snapshot") {
+            lastAisAtRef.current = Date.now();
+            setAisReceiving(true);
+          }
+          setVessels(vesselsFromBatch(msg.vessels));
+        }
       } else if (msg.type === "tracks_batch") {
-        setTracks(msg.tracks);
+        if (playheadModeRef.current !== "scene") {
+          setTracks(msg.tracks);
+        }
       } else if (msg.type === "ais") {
         applyAis(msg);
+        if (playheadModeRef.current !== "scene") {
+          lastAisAtRef.current = Date.now();
+          setAisReceiving(true);
+          setCurrent(msg.t);
+        }
+      } else if (msg.type === "scene_frame") {
+        playheadModeRef.current = "scene";
+        setPlayheadMode("scene");
+        setCurrent(msg.t);
+        setCurrentSceneId(String(msg.scene_id));
+        setSarDetections(
+          msg.sar.map((d) => ({
+            ...d,
+            id: String(d.id),
+          })),
+        );
+        const aisPoints = (msg.ais ?? []).map((v) => ({
+          mmsi: v.mmsi,
+          lat: v.lat,
+          lon: v.lon,
+        }));
+        setContacts(normalizeSceneContacts(msg.contacts, aisPoints));
+        setVessels(vesselsFromBatch(msg.ais ?? []));
+        setTracks(msg.tracks ?? []);
+      } else if (msg.type === "alert") {
+        setAlerts((prev) => [msg, ...prev].slice(0, 100));
       }
     });
     clientRef.current = client;
     return () => client.close();
-  }, [applyAis, mode, speed]);
+  }, [applyAis, clearSceneOverlay]);
 
   const vesselList = useMemo(() => Array.from(vessels.values()), [vessels]);
-  const filteredVesselList = useMemo(() => {
-    let list = filterVesselsByShipType(vesselList, shipTypeFilter);
-    list = filterVesselsByNation(list, nationFilter);
-    return list;
-  }, [vesselList, shipTypeFilter, nationFilter]);
+  const filteredVesselList = useMemo(
+    () =>
+      filterVessels(vesselList, {
+        shipTypeFilter,
+        nationFilter,
+        searchQuery,
+        movingOnly,
+      }),
+    [vesselList, shipTypeFilter, nationFilter, searchQuery, movingOnly],
+  );
   const filteredTracks = useMemo(() => {
-    if (shipTypeFilter.size === 0 && nationFilter.size === 0) return tracks;
+    if (
+      shipTypeFilter.size === 0 &&
+      nationFilter.size === 0 &&
+      !searchQuery.trim() &&
+      !movingOnly
+    ) {
+      return tracks;
+    }
     const visibleMmsis = new Set(filteredVesselList.map((vessel) => vessel.mmsi));
     return tracks.filter((track) => visibleMmsis.has(track.mmsi));
-  }, [tracks, filteredVesselList, shipTypeFilter, nationFilter]);
+  }, [tracks, filteredVesselList, shipTypeFilter, nationFilter, searchQuery, movingOnly]);
+  const attentionCount = useMemo(() => countAttentionAlerts(alerts), [alerts]);
   const selectedVessel = selectedMmsi != null ? vessels.get(selectedMmsi) ?? null : null;
-  const send = (payload: Record<string, unknown>) => clientRef.current?.send(payload);
-
-  const isLive = mode === "live" || (scenario != null && current !== "" && toMs(current) >= toMs(scenario.end) - 2000);
-
-  const handleSelectVessel = useCallback((mmsi: number | null) => {
-    setSelectedMmsi(mmsi);
-  }, []);
+  const client = () => clientRef.current;
 
   const handleCenterSelected = useCallback(() => {
     if (selectedMmsi == null) return;
@@ -253,20 +321,83 @@ export default function App() {
     setCenterRequest({ lat: vessel.lat, lon: vessel.lon, token: Date.now() });
   }, [selectedMmsi, vessels]);
 
+  const handleClearFilters = useCallback(() => {
+    setShipTypeFilter(new Set());
+    setNationFilter(new Set());
+    setSearchQuery("");
+    setMovingOnly(false);
+  }, []);
+
+  const dataStart = corridor?.dataStart ?? current;
+  const liveEdge = corridor?.liveEdge ?? current;
+  const dataEnd = corridor?.dataEnd ?? liveEdge;
+
+  const emptyMapState = useMemo(
+    () =>
+      resolveEmptyMapState({
+        connected,
+        playheadMode,
+        vesselCount: vesselList.length,
+        aisConnected,
+        positionCount,
+        dataStart,
+        liveEdge,
+        sarDetectionCount: sarDetections.length,
+      }),
+    [
+      connected,
+      playheadMode,
+      vesselList.length,
+      aisConnected,
+      positionCount,
+      dataStart,
+      liveEdge,
+      sarDetections.length,
+    ],
+  );
+  const emptyMapMessage = useMemo(() => emptyMapCopy(emptyMapState), [emptyMapState]);
+
+  const handleSeek = useCallback(
+    (t: string) => {
+      const targetMs = toMs(t);
+      const liveMs = toMs(liveEdge);
+      const endMs = toMs(dataEnd);
+      if (liveMs - targetMs <= LIVE_EDGE_MS) {
+        clientRef.current?.goLive();
+      } else if (targetMs > endMs) {
+        clientRef.current?.goLive();
+      } else {
+        clientRef.current?.seek(t);
+      }
+    },
+    [dataEnd, liveEdge],
+  );
+
+  const handlePlay = useCallback(() => {
+    if (playheadMode === "live") {
+      clientRef.current?.seek(dataEnd);
+      window.setTimeout(() => clientRef.current?.play(), 50);
+      return;
+    }
+    clientRef.current?.play();
+  }, [dataEnd, playheadMode]);
+
   return (
     <div className="app">
       <TopBar
         connected={connected}
-        playing={playing}
-        current={current || scenario?.start || ""}
-        scenarioName={scenario?.name}
+        current={current || liveEdge}
+        scenarioName={corridor?.name}
+        dataStart={dataStart}
+        liveEdge={liveEdge}
         vesselCount={filteredVesselList.length}
+        attentionCount={attentionCount}
         trackCount={filteredTracks.length}
         positionCount={positionCount}
-        isLive={isLive}
-        mode={mode}
+        sceneCount={sceneCount}
+        playheadMode={playheadMode}
         aisConnected={aisConnected}
-        onModeChange={switchMode}
+        aisReceiving={aisReceiving}
       />
 
       <div
@@ -281,12 +412,13 @@ export default function App() {
         <MapView
           vessels={filteredVesselList}
           tracks={filteredTracks}
-          sarDetections={sarDetections}
-          bbox={scenario?.bbox}
+          sarDetections={playheadMode === "scene" ? sarDetections : []}
+          contacts={playheadMode === "scene" ? contacts : []}
+          bbox={corridor?.bbox}
           cables={cables}
           selectedMmsi={selectedMmsi}
           layers={layers}
-          onSelectVessel={handleSelectVessel}
+          onSelectVessel={setSelectedMmsi}
           centerRequest={centerRequest}
         />
 
@@ -294,7 +426,8 @@ export default function App() {
           className={`ops-overlay ops-overlay--left${fleetCollapsed ? " ops-overlay--collapsed" : ""}`}
         >
           <FleetPanel
-            vessels={vesselList}
+            vessels={filteredVesselList}
+            allVessels={vesselList}
             selectedMmsi={selectedMmsi}
             onSelect={setSelectedMmsi}
             onCollapsedChange={setFleetCollapsed}
@@ -302,6 +435,12 @@ export default function App() {
             onShipTypeFilterChange={setShipTypeFilter}
             nationFilter={nationFilter}
             onNationFilterChange={setNationFilter}
+            searchQuery={searchQuery}
+            onSearchQueryChange={setSearchQuery}
+            movingOnly={movingOnly}
+            onMovingOnlyChange={setMovingOnly}
+            onClearFilters={handleClearFilters}
+            referenceTime={current || dataStart}
           />
         </div>
 
@@ -313,60 +452,58 @@ export default function App() {
             alerts={alerts}
             onCenter={handleCenterSelected}
             onCollapsedChange={setDetailCollapsed}
+            referenceTime={current || dataStart}
           />
         </div>
 
         <div className="ops-overlay ops-overlay--top-right">
-          <LayerToggles layers={layers} onChange={setLayers} />
+          <LayerToggles layers={layers} playheadMode={playheadMode} onChange={setLayers} />
         </div>
 
-        {mode === "live" && (
-          <div className="ops-overlay ops-overlay--bottom-left">
+        <div className="ops-overlay ops-overlay--bottom-right">
+          <MapLegend />
+        </div>
+
+        <div className="ops-overlay ops-overlay--bottom-left">
+          {playheadMode === "scene" ? (
+            <SceneContactFeed
+              contacts={contacts}
+              sceneTime={current}
+              onSelectMmsi={setSelectedMmsi}
+            />
+          ) : (
             <EventFeed events={alerts} onSelectMmsi={setSelectedMmsi} />
-          </div>
-        )}
+          )}
+        </div>
 
-        {connected && mode === "replay" && positionCount === 0 && (
+        {emptyMapMessage ? (
           <div className="empty-banner">
-            <strong>No contacts in area of interest</strong>
-            Load corridor traffic:
-            <code>python scripts/load_live_ais.py --clear</code>
-            Or switch to live mode for AISStream ingest.
+            <strong>{emptyMapMessage.title}</strong>
+            {emptyMapMessage.body}
           </div>
-        )}
-
-        {connected && mode === "live" && !aisConnected && (
-          <div className="empty-banner">
-            <strong>AISStream not connected</strong>
-            Set <code>AISSTREAM_API_KEY</code> in the backend environment and restart.
-          </div>
-        )}
+        ) : null}
       </div>
 
-      {mode === "replay" && scenario && (
-        <TimelineDock
-          playing={playing}
-          current={current || scenario.end}
-          start={scenario.start}
-          end={scenario.end}
-          dataStart={scenario.dataStart}
-          dataEnd={scenario.dataEnd}
-          windowPreset={windowPreset}
-          windowPresets={WINDOW_PRESETS}
-          speed={speed}
-          onPlay={() => send({ action: "play" })}
-          onPause={() => send({ action: "pause" })}
-          onSeek={(t) => send({ action: "seek", t })}
-          onWindowPreset={(preset) => {
-            setWindowPreset(preset);
-            send({ action: "set_window", preset });
-          }}
-          onSpeed={(multiplier) => {
-            setSpeed(multiplier);
-            send({ action: "speed", multiplier });
-          }}
-        />
-      )}
+      <TimelineDock
+        playing={playing}
+        current={current || liveEdge}
+        dataStart={dataStart}
+        liveEdge={liveEdge}
+        playheadMode={playheadMode}
+        scenes={scenes}
+        currentSceneId={currentSceneId}
+        positionCount={positionCount}
+        speed={speed}
+        onPlay={handlePlay}
+        onPause={() => client()?.pause()}
+        onSeek={handleSeek}
+        onGoLive={() => client()?.goLive()}
+        onSceneClick={(sceneId) => client()?.snapScene(sceneId)}
+        onSpeed={(multiplier) => {
+          setSpeed(multiplier);
+          client()?.speed(multiplier);
+        }}
+      />
     </div>
   );
 }
