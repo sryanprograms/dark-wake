@@ -3,32 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import ssl
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import certifi
-import websockets
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
 from app.config.aoi import AOI_NAME, BBOX
 from app.config.settings import Settings, get_settings
-from app.db.session import get_session_factory
-from app.ingest.ais_stream import AISSTREAM_URL, build_subscription_message, parse_aisstream_message
-from app.live.detect import detect_ais_gap_resume, detect_ais_silent
-from app.live.persist import persist_operator_event
+from app.ingest.ais_ingest import get_ais_ingest_service
 from app.live.registry import VesselRegistry
 from app.live.sar_poller import poll_sar_detections
 
 logger = logging.getLogger(__name__)
 
 BATCH_THRESHOLD = 25
-GAP_SWEEP_INTERVAL_S = 60
 BROADCAST_TRACK_INTERVAL_S = 30
-GAP_SOURCE = "aisstream"
 
 _hub: "LiveHub | None" = None
 
@@ -48,7 +39,7 @@ class LiveHub:
         self._settings: Settings | None = None
         self._tasks: list[asyncio.Task] = []
         self._sar_seen: set[str] = set()
-        self._last_ingest_at: dict[int, datetime] = {}
+        self._sar_cache: list[dict[str, Any]] = []
 
     async def start(self, settings: Settings | None = None) -> None:
         get_settings.cache_clear()
@@ -56,14 +47,20 @@ class LiveHub:
         self.registry = VesselRegistry(
             track_max_age=timedelta(hours=self._settings.live_track_buffer_hours)
         )
-        if self._settings.aisstream_api_key:
-            self._tasks.append(asyncio.create_task(self._run_ais_stream()))
-        else:
-            logger.warning("AISSTREAM_API_KEY not set — live AIS ingest disabled")
-        self._tasks.append(asyncio.create_task(self._gap_sweep_loop()))
+
+        ingest = get_ais_ingest_service()
+        ingest.on_connected(self._on_ais_connected)
+        ingest.on_update(self._handle_update)
+
+        # Gap detection / alert persistence is owned solely by TimelineHub to
+        # avoid duplicate alerts on the shared AIS ingest service.
         self._tasks.append(asyncio.create_task(self._track_broadcast_loop()))
         if self._settings.gfw_api_token:
             self._tasks.append(asyncio.create_task(self._sar_poll_loop()))
+
+    async def _on_ais_connected(self, connected: bool) -> None:
+        self.ais_connected = connected
+        await self._broadcast_live_state()
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -94,82 +91,26 @@ class LiveHub:
         tracks = self.registry.tracks()
         if tracks:
             await self._send_json(websocket, {"type": "tracks_batch", "tracks": tracks})
+        if self._sar_cache:
+            await self._send_json(
+                websocket,
+                {"type": "sar_batch", "detections": self._sar_cache},
+            )
 
     async def unsubscribe(self, websocket: WebSocket) -> None:
         self.clients.discard(websocket)
-
-    async def _run_ais_stream(self) -> None:
-        assert self._settings is not None
-        api_key = self._settings.aisstream_api_key
-        subscription = build_subscription_message(api_key)
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-
-        while True:
-            try:
-                async with websockets.connect(AISSTREAM_URL, ssl=ssl_context) as ws:
-                    await ws.send(json.dumps(subscription))
-                    self.ais_connected = True
-                    await self._broadcast_live_state()
-                    logger.info("AISStream connected for AOI %s", AOI_NAME)
-
-                    async for raw in ws:
-                        try:
-                            message = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        if "error" in message:
-                            logger.error("AISStream error: %s", message.get("error"))
-                            break
-                        update = parse_aisstream_message(message)
-                        if update is None:
-                            continue
-                        await self._handle_update(update)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("AISStream connection failed; retrying in 10s")
-                self.ais_connected = False
-                await self._broadcast_live_state()
-                await asyncio.sleep(10)
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         if update["kind"] == "static":
             self.registry.apply_static(update)
             return
 
-        mmsi = int(update["mmsi"])
-        ingest_at = datetime.now(timezone.utc)
-        previous_at = self._last_ingest_at.get(mmsi)
-
         state = self.registry.apply_position(
             update,
-            ingest_at=ingest_at,
-            gap_monitor=True,
+            ingest_at=datetime.now(timezone.utc),
         )
-        self._last_ingest_at[mmsi] = ingest_at
 
         await self._send_ais_events_to_all([self.registry.vessel_ais_event(state)])
-
-        alert = detect_ais_gap_resume(
-            state,
-            previous_at=previous_at,
-            current_at=ingest_at,
-            source=GAP_SOURCE,
-        )
-        if alert:
-            await self._emit_alert(alert, mmsi=mmsi)
-
-    async def _gap_sweep_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(GAP_SWEEP_INTERVAL_S)
-                now = datetime.now(timezone.utc)
-                for state in self.registry.vessels():
-                    alert = detect_ais_silent(state, now=now, source=GAP_SOURCE)
-                    if alert:
-                        await self._emit_alert(alert, mmsi=state.mmsi)
-            except asyncio.CancelledError:
-                raise
 
     async def _track_broadcast_loop(self) -> None:
         while True:
@@ -190,27 +131,18 @@ class LiveHub:
                     seen=self._sar_seen,
                 )
                 if new_dets:
-                    await self._broadcast({"type": "sar_batch", "detections": new_dets})
+                    by_id = {d["id"]: d for d in self._sar_cache}
+                    for det in new_dets:
+                        by_id[det["id"]] = det
+                    self._sar_cache = list(by_id.values())
+                    await self._broadcast(
+                        {"type": "sar_batch", "detections": self._sar_cache}
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("SAR poll failed")
             await asyncio.sleep(self._settings.sar_poll_interval_s)
-
-    async def _emit_alert(self, alert: dict[str, Any], *, mmsi: int) -> None:
-        excerpt = self.registry.track_excerpt(mmsi)
-        try:
-            factory = get_session_factory()
-            async with factory() as session:
-                event_id = await persist_operator_event(
-                    session, event=alert, track_excerpt=excerpt
-                )
-        except Exception:
-            logger.exception("Failed to persist operator event")
-            event_id = None
-
-        payload = {"type": "alert", **alert, "id": event_id}
-        await self._broadcast(payload)
 
     async def _broadcast_live_state(self) -> None:
         await self._broadcast(

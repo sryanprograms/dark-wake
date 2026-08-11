@@ -24,6 +24,9 @@ class Settings:
     digitraffic_user: str
     live_track_buffer_hours: float
     sar_poll_interval_s: int
+    ais_persist_enabled: bool
+    ais_persist_flush_interval_s: int
+    ais_persist_min_interval_s: int
 
 
 @lru_cache
@@ -41,4 +44,8 @@ def get_settings() -> Settings:
         ),
         live_track_buffer_hours=float(os.getenv("LIVE_TRACK_BUFFER_HOURS", "6")),
         sar_poll_interval_s=int(os.getenv("SAR_POLL_INTERVAL_S", "3600")),
+        ais_persist_enabled=os.getenv("AIS_PERSIST_ENABLED", "true").lower()
+        in ("1", "true", "yes"),
+        ais_persist_flush_interval_s=int(os.getenv("AIS_PERSIST_FLUSH_INTERVAL_S", "15")),
+        ais_persist_min_interval_s=int(os.getenv("AIS_PERSIST_MIN_INTERVAL_S", "60")),
     )
