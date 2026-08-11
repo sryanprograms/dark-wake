@@ -1,0 +1,29 @@
+# VCS / editor
+.git
+.gitignore
+.vscode
+.idea
+
+# Python
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.venv/
+venv/
+backend/tests/
+
+# Node / frontend build artifacts (rebuilt inside the image)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Local data & secrets
+data/
+.env
+.env.*
+!.env.example
+
+# Docs / misc
+docs/
+*.md
