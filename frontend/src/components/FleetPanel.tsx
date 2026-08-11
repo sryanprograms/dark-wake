@@ -4,7 +4,6 @@ import {
   createColumnHelper,
   flexRender,
   getCoreRowModel,
-  getFilteredRowModel,
   getSortedRowModel,
   SortingState,
   useReactTable,
@@ -12,15 +11,15 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search, Ship } from "lucide-react";
 import type { VesselPoint } from "../map/MapView";
-import { formatUtcShort } from "../utils/time";
-import { matchesShipTypeFilter } from "../utils/shipTypes";
-import { matchesNationFilter } from "../utils/nations";
+import { formatLastReportLong, formatReportAge, formatUtcShort } from "../utils/time";
+import { isVesselMoving } from "../utils/vesselFilters";
 import { CollapsiblePanel } from "./CollapsiblePanel";
 import { NationFilter } from "./NationFilter";
 import { ShipTypeFilter } from "./ShipTypeFilter";
 
 type FleetPanelProps = {
   vessels: VesselPoint[];
+  allVessels: VesselPoint[];
   selectedMmsi: number | null;
   onSelect: (mmsi: number) => void;
   onCollapsedChange?: (collapsed: boolean) => void;
@@ -28,6 +27,12 @@ type FleetPanelProps = {
   onShipTypeFilterChange: (types: Set<string>) => void;
   nationFilter: Set<string>;
   onNationFilterChange: (nations: Set<string>) => void;
+  searchQuery: string;
+  onSearchQueryChange: (query: string) => void;
+  movingOnly: boolean;
+  onMovingOnlyChange: (movingOnly: boolean) => void;
+  onClearFilters: () => void;
+  referenceTime?: string;
 };
 
 type FleetRow = VesselPoint & { moving: boolean };
@@ -55,13 +60,13 @@ const columns = [
     },
   }),
   columnHelper.accessor("flag", {
-    header: "Flag",
+    header: "Nation",
     cell: (info) => {
       const flag = info.getValue();
       const country = info.row.original.country;
       return (
-        <span className="fleet-cell fleet-cell--mono" title={country || undefined}>
-          {flag || "—"}
+        <span className="fleet-cell fleet-cell--mono" title={flag || undefined}>
+          {country || flag || "—"}
         </span>
       );
     },
@@ -75,7 +80,7 @@ const columns = [
     ),
   }),
   columnHelper.accessor("sog", {
-    header: "SOG",
+    header: "Speed",
     cell: (info) => {
       const sog = info.getValue();
       return (
@@ -86,7 +91,7 @@ const columns = [
     },
   }),
   columnHelper.accessor("heading", {
-    header: "HDG",
+    header: "Heading",
     cell: (info) => (
       <span className="fleet-cell fleet-cell--mono">
         {info.getValue() != null && info.getValue() !== 511 ? `${info.getValue()}°` : "—"}
@@ -94,7 +99,7 @@ const columns = [
     ),
   }),
   columnHelper.accessor("t", {
-    header: "Last",
+    header: "Last report",
     cell: (info) => (
       <span className="fleet-cell fleet-cell--mono fleet-cell--muted">
         {info.getValue() ? formatUtcShort(info.getValue()!) : "—"}
@@ -105,6 +110,7 @@ const columns = [
 
 export function FleetPanel({
   vessels,
+  allVessels,
   selectedMmsi,
   onSelect,
   onCollapsedChange,
@@ -112,9 +118,13 @@ export function FleetPanel({
   onShipTypeFilterChange,
   nationFilter,
   onNationFilterChange,
+  searchQuery,
+  onSearchQueryChange,
+  movingOnly,
+  onMovingOnlyChange,
+  onClearFilters,
+  referenceTime,
 }: FleetPanelProps) {
-  const [query, setQuery] = useState("");
-  const [movingOnly, setMovingOnly] = useState(false);
   const [sorting, setSorting] = useState<SortingState>([{ id: "mmsi", desc: false }]);
   const parentRef = useRef<HTMLDivElement>(null);
 
@@ -122,7 +132,7 @@ export function FleetPanel({
     () =>
       vessels.map((v) => ({
         ...v,
-        moving: v.sog != null && v.sog > 0.5,
+        moving: isVesselMoving(v),
       })),
     [vessels],
   );
@@ -130,50 +140,33 @@ export function FleetPanel({
   const table = useReactTable({
     data,
     columns,
-    state: { sorting, globalFilter: query },
+    state: { sorting },
     onSortingChange: setSorting,
-    globalFilterFn: (row, _columnId, filterValue) => {
-      const q = String(filterValue).toLowerCase();
-      if (!q) return true;
-      const v = row.original;
-      return (
-        String(v.mmsi).includes(q) ||
-        (v.name?.toLowerCase().includes(q) ?? false) ||
-        (v.flag?.toLowerCase().includes(q) ?? false) ||
-        (v.country?.toLowerCase().includes(q) ?? false) ||
-        (v.ship_type?.toLowerCase().includes(q) ?? false)
-      );
-    },
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
   });
 
-  const filteredRows = useMemo(() => {
-    let rows = table.getRowModel().rows;
-    if (movingOnly) rows = rows.filter((r) => r.original.moving);
-    if (shipTypeFilter.size > 0) {
-      rows = rows.filter((r) => matchesShipTypeFilter(r.original, shipTypeFilter));
-    }
-    if (nationFilter.size > 0) {
-      rows = rows.filter((r) => matchesNationFilter(r.original, nationFilter));
-    }
-    return rows;
-  }, [table, movingOnly, shipTypeFilter, nationFilter, query, sorting, data]);
+  const rows = table.getRowModel().rows;
 
   const virtualizer = useVirtualizer({
-    count: filteredRows.length,
+    count: rows.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 36,
+    estimateSize: () => 42,
     overscan: 12,
   });
+
+  const filtersActive =
+    shipTypeFilter.size > 0 ||
+    nationFilter.size > 0 ||
+    searchQuery.trim().length > 0 ||
+    movingOnly;
 
   return (
     <CollapsiblePanel
       className="fleet-panel"
-      title="Order of battle"
+      title="Vessels"
       icon={<Ship size={14} />}
-      count={filteredRows.length}
+      count={rows.length}
       edge="left"
       onCollapsedChange={onCollapsedChange}
     >
@@ -182,18 +175,18 @@ export function FleetPanel({
           <Search size={14} />
           <input
             type="search"
-            placeholder="Search MMSI, name, flag, type…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search name, nation, type, or ID…"
+            value={searchQuery}
+            onChange={(e) => onSearchQueryChange(e.target.value)}
           />
         </div>
         <ShipTypeFilter
-          vessels={vessels}
+          vessels={allVessels}
           selectedTypes={shipTypeFilter}
           onChange={onShipTypeFilterChange}
         />
         <NationFilter
-          vessels={vessels}
+          vessels={allVessels}
           selectedNations={nationFilter}
           onChange={onNationFilterChange}
         />
@@ -201,37 +194,47 @@ export function FleetPanel({
           <input
             type="checkbox"
             checked={movingOnly}
-            onChange={(e) => setMovingOnly(e.target.checked)}
+            onChange={(e) => onMovingOnlyChange(e.target.checked)}
           />
-          Moving only
+          Underway only
         </label>
       </div>
 
-      <div className="fleet-table-head">
-        {table.getHeaderGroups().map((hg) =>
-          hg.headers.map((header) => (
-            <button
-              key={header.id}
-              type="button"
-              className="fleet-table-head__cell"
-              onClick={header.column.getToggleSortingHandler()}
-            >
-              {flexRender(header.column.columnDef.header, header.getContext())}
-              {header.column.getIsSorted() === "asc" && " ↑"}
-              {header.column.getIsSorted() === "desc" && " ↓"}
-            </button>
-          )),
-        )}
-      </div>
+      {filtersActive ? (
+        <div className="fleet-panel__filter-chip">
+          <span>
+            Showing {rows.length} of {allVessels.length} vessels on the map
+          </span>
+          <button type="button" className="fleet-panel__filter-clear" onClick={onClearFilters}>
+            Clear filters
+          </button>
+        </div>
+      ) : null}
 
       <ScrollArea.Root className="fleet-scroll">
         <ScrollArea.Viewport ref={parentRef} className="fleet-scroll__viewport">
+          <div className="fleet-table-head">
+            {table.getHeaderGroups().map((hg) =>
+              hg.headers.map((header) => (
+                <button
+                  key={header.id}
+                  type="button"
+                  className="fleet-table-head__cell"
+                  onClick={header.column.getToggleSortingHandler()}
+                >
+                  {flexRender(header.column.columnDef.header, header.getContext())}
+                  {header.column.getIsSorted() === "asc" && " ↑"}
+                  {header.column.getIsSorted() === "desc" && " ↓"}
+                </button>
+              )),
+            )}
+          </div>
           <div
             className="fleet-scroll__inner"
             style={{ height: `${virtualizer.getTotalSize()}px` }}
           >
             {virtualizer.getVirtualItems().map((virtualRow) => {
-              const row = filteredRows[virtualRow.index];
+              const row = rows[virtualRow.index];
               const selected = row.original.mmsi === selectedMmsi;
               const name = row.original.name?.trim();
               return (
@@ -249,8 +252,8 @@ export function FleetPanel({
                   <span className="fleet-row__name" title={name || undefined}>
                     {name || "—"}
                   </span>
-                  <span className="fleet-row__flag" title={row.original.country || undefined}>
-                    {row.original.flag || "—"}
+                  <span className="fleet-row__flag" title={row.original.flag || undefined}>
+                    {row.original.country || row.original.flag || "—"}
                   </span>
                   <span className="fleet-row__type" title={row.original.ship_type || undefined}>
                     {row.original.ship_type || "—"}
@@ -263,8 +266,22 @@ export function FleetPanel({
                       ? `${row.original.heading}°`
                       : "—"}
                   </span>
-                  <span className="fleet-row__time">
-                    {row.original.t ? formatUtcShort(row.original.t) : "—"}
+                  <span
+                    className="fleet-row__time"
+                    title={row.original.t ? formatLastReportLong(row.original.t, referenceTime) : undefined}
+                  >
+                    {row.original.t ? (
+                      <>
+                        <span className="fleet-row__time-clock">
+                          {formatUtcShort(row.original.t)}
+                        </span>
+                        <span className="fleet-row__time-ago">
+                          {formatReportAge(row.original.t, referenceTime)}
+                        </span>
+                      </>
+                    ) : (
+                      "—"
+                    )}
                   </span>
                 </button>
               );

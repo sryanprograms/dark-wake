@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Anchor, Crosshair } from "lucide-react";
+import { AlertTriangle, Anchor, ChevronDown, Crosshair } from "lucide-react";
 import type { VesselPoint } from "../map/MapView";
-import { formatUtc, formatUtcShort } from "../utils/time";
-import type { AlertEvent } from "../ws/live";
+import { alertKindLabel, alertTierLabel, isAttentionAlert } from "../utils/alerts";
+import { isVesselMoving } from "../utils/vesselFilters";
+import { formatLastReportLong, formatUtcShort } from "../utils/time";
+import type { AlertEvent } from "../ws/timeline";
 import { CollapsiblePanel } from "./CollapsiblePanel";
 
 type VesselDetailProps = {
@@ -10,15 +12,8 @@ type VesselDetailProps = {
   alerts?: AlertEvent[];
   onCenter?: () => void;
   onCollapsedChange?: (collapsed: boolean) => void;
+  referenceTime?: string;
 };
-
-function isAisSilenceAlert(alert: AlertEvent): boolean {
-  return (
-    alert.kind === "ais_silent" ||
-    alert.kind === "ais_gap_resume" ||
-    alert.kind === "ais_gap"
-  );
-}
 
 function alertSeverityClass(severity: string): string {
   if (severity === "high") return "detail-panel__alert--high";
@@ -35,13 +30,29 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function VesselDetail({ vessel, alerts = [], onCenter, onCollapsedChange }: VesselDetailProps) {
+function vesselSubtitle(vessel: VesselPoint): string {
+  const parts: string[] = [];
+  const flag = vessel.country ?? vessel.flag;
+  if (flag) parts.push(`${flag}-flagged`);
+  if (vessel.ship_type) parts.push(vessel.ship_type.toLowerCase());
+  const moving = isVesselMoving(vessel);
+  if (vessel.sog != null) {
+    parts.push(`${moving ? "underway" : "stopped"} at ${vessel.sog.toFixed(1)} kn`);
+  } else {
+    parts.push(moving ? "underway" : "stopped");
+  }
+  return parts.join(" · ");
+}
+
+export function VesselDetail({ vessel, alerts = [], onCenter, onCollapsedChange, referenceTime }: VesselDetailProps) {
   const [collapsed, setCollapsed] = useState(!vessel);
 
   const vesselAlerts = useMemo(() => {
     if (!vessel) return [];
-    return alerts.filter((alert) => alert.mmsi === vessel.mmsi && isAisSilenceAlert(alert));
+    return alerts.filter((alert) => alert.mmsi === vessel.mmsi && isAttentionAlert(alert));
   }, [alerts, vessel]);
+
+  const primaryAlert = vesselAlerts[0];
 
   useEffect(() => {
     if (vessel) {
@@ -58,14 +69,14 @@ export function VesselDetail({ vessel, alerts = [], onCenter, onCollapsedChange 
   const headerActions =
     vessel && onCenter ? (
       <button type="button" className="detail-panel__center" onClick={onCenter}>
-        Center
+        Center map
       </button>
     ) : undefined;
 
   return (
     <CollapsiblePanel
       className="detail-panel"
-      title="Contact detail"
+      title="Selected vessel"
       icon={<Crosshair size={14} />}
       edge="right"
       collapsed={collapsed}
@@ -75,61 +86,86 @@ export function VesselDetail({ vessel, alerts = [], onCenter, onCollapsedChange 
       {!vessel ? (
         <div className="detail-panel__placeholder">
           <Anchor size={28} strokeWidth={1.25} />
-          <p>Select a contact from the map or fleet list to inspect.</p>
+          <p>Select a vessel on the map or from the list to see details and any alerts.</p>
         </div>
       ) : (
         <>
           {(() => {
-            const moving = vessel.sog != null && vessel.sog > 0.5;
-            const name = vessel.name?.trim() || `MMSI ${vessel.mmsi}`;
+            const moving = isVesselMoving(vessel);
+            const name = vessel.name?.trim() || `Vessel ${vessel.mmsi}`;
 
             return (
               <>
                 <div className="detail-panel__title">
                   <h2>{name}</h2>
+                  <p className="detail-panel__subtitle">{vesselSubtitle(vessel)}</p>
                   <span
                     className={`contact-badge ${moving ? "contact-badge--moving" : "contact-badge--idle"}`}
                   >
-                    {moving ? "Underway" : "Stationary"}
+                    {moving ? "Underway" : "Stopped"}
                   </span>
                 </div>
 
-                <div className="detail-panel__section">
-                  <DetailRow label="MMSI" value={String(vessel.mmsi)} />
-                  <DetailRow label="Flag" value={vessel.country ?? vessel.flag ?? "—"} />
-                  <DetailRow label="Ship type" value={vessel.ship_type ?? "—"} />
-                  <DetailRow label="Latitude" value={vessel.lat.toFixed(5)} />
-                  <DetailRow label="Longitude" value={vessel.lon.toFixed(5)} />
-                  <DetailRow
-                    label="SOG"
-                    value={vessel.sog != null ? `${vessel.sog.toFixed(1)} kn` : "—"}
-                  />
-                  <DetailRow
-                    label="COG"
-                    value={vessel.cog != null ? `${vessel.cog.toFixed(0)}°` : "—"}
-                  />
-                  <DetailRow
-                    label="Heading"
-                    value={
-                      vessel.heading != null && vessel.heading !== 511
-                        ? `${vessel.heading.toFixed(0)}°`
-                        : "—"
-                    }
-                  />
-                  <DetailRow label="Last report" value={vessel.t ? formatUtc(vessel.t) : "—"} />
-                </div>
-
-                <div className="detail-panel__alerts">
-                  <div className="detail-panel__alerts-header">
-                    <AlertTriangle size={14} />
-                    <span>Alerts</span>
-                    {vesselAlerts.length > 0 ? (
-                      <span className="detail-panel__alerts-count">{vesselAlerts.length}</span>
-                    ) : null}
+                {primaryAlert ? (
+                  <div className="detail-panel__insight">
+                    <div className="detail-panel__insight-header">
+                      <AlertTriangle size={14} />
+                      <span>Why this matters</span>
+                    </div>
+                    <p className="detail-panel__insight-reason">
+                      {primaryAlert.reason || primaryAlert.title}
+                    </p>
+                    <div className="detail-panel__insight-meta">
+                      <span>{alertKindLabel(primaryAlert.kind)}</span>
+                      {alertTierLabel(primaryAlert.tier) ? (
+                        <span>{alertTierLabel(primaryAlert.tier)}</span>
+                      ) : null}
+                      <span>{formatUtcShort(primaryAlert.t)}</span>
+                    </div>
                   </div>
-                  {vesselAlerts.length === 0 ? (
-                    <p className="detail-panel__alerts-empty">No AIS silence alerts for this contact.</p>
-                  ) : (
+                ) : null}
+
+                <details className="detail-panel__details" open>
+                  <summary className="detail-panel__details-summary">
+                    Vessel details
+                    <ChevronDown size={14} className="detail-panel__details-chevron" aria-hidden />
+                  </summary>
+                  <div className="detail-panel__section">
+                    <DetailRow label="MMSI" value={String(vessel.mmsi)} />
+                    <DetailRow label="Nation" value={vessel.country ?? vessel.flag ?? "—"} />
+                    <DetailRow label="Ship type" value={vessel.ship_type ?? "—"} />
+                    <DetailRow label="Latitude" value={vessel.lat.toFixed(5)} />
+                    <DetailRow label="Longitude" value={vessel.lon.toFixed(5)} />
+                    <DetailRow
+                      label="Speed (SOG)"
+                      value={vessel.sog != null ? `${vessel.sog.toFixed(1)} kn` : "—"}
+                    />
+                    <DetailRow
+                      label="Course (COG)"
+                      value={vessel.cog != null ? `${vessel.cog.toFixed(0)}°` : "—"}
+                    />
+                    <DetailRow
+                      label="Heading"
+                      value={
+                        vessel.heading != null && vessel.heading !== 511
+                          ? `${vessel.heading.toFixed(0)}°`
+                          : "—"
+                      }
+                    />
+                    <DetailRow
+                      label="Last report"
+                      value={vessel.t ? formatLastReportLong(vessel.t, referenceTime) : "—"}
+                    />
+                  </div>
+                </details>
+
+                {vesselAlerts.length > 0 ? (
+                  <div className="detail-panel__alerts">
+                    <div className="detail-panel__alerts-header">
+                      <AlertTriangle size={14} />
+                      <span>All alerts</span>
+                      <span className="detail-panel__alerts-count">{vesselAlerts.length}</span>
+                    </div>
                     <ul className="detail-panel__alert-list">
                       {vesselAlerts.map((alert, index) => (
                         <li
@@ -137,15 +173,19 @@ export function VesselDetail({ vessel, alerts = [], onCenter, onCollapsedChange 
                           className={`detail-panel__alert ${alertSeverityClass(alert.severity)}`}
                         >
                           <div className="detail-panel__alert-title">{alert.title}</div>
-                          <div className="detail-panel__alert-meta">{formatUtcShort(alert.t)}</div>
+                          <div className="detail-panel__alert-meta">
+                            {formatUtcShort(alert.t)} · {alertKindLabel(alert.kind)}
+                          </div>
                           {alert.reason ? (
                             <div className="detail-panel__alert-reason">{alert.reason}</div>
                           ) : null}
                         </li>
                       ))}
                     </ul>
-                  )}
-                </div>
+                  </div>
+                ) : (
+                  <p className="detail-panel__alerts-empty">No alerts for this vessel.</p>
+                )}
               </>
             );
           })()}
