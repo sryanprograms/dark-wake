@@ -1,0 +1,34 @@
+# Render Blueprint for DarkWake (free stack).
+#
+# One Docker web service (FastAPI + built React SPA on a single origin) on
+# Render's FREE plan, backed by an external free PostGIS database (Supabase or
+# Neon). Deploy via Render Dashboard -> Blueprints.
+#
+# The free web service spins down after 15 min of inactivity. A free UptimeRobot
+# monitor pinging /health every ~5 min keeps it awake AND gives you monitoring
+# (see DEPLOY.md).
+services:
+  - type: web
+    name: darkwake
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      # Set in the Render Dashboard: your Supabase/Neon *Session-mode pooler*
+      # connection string (IPv4, port 5432). Kept out of source control.
+      - key: DATABASE_URL
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+      - key: AIS_PERSIST_ENABLED
+        value: "true"
+      - key: DIGITRAFFIC_USER
+        value: "DarkWake/Production 0.2 (contact: you@example.com)"
+      # Data-source secrets — set these in the Render Dashboard.
+      - key: GFW_API_TOKEN
+        sync: false
+      - key: AISSTREAM_API_KEY
+        sync: false
