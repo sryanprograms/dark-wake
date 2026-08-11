@@ -15,6 +15,9 @@ _session_factory = None
 def _async_database_url(url: str) -> str:
     if url.startswith("postgresql+asyncpg://"):
         return url
+    # Managed providers (e.g. Render) may hand out a `postgres://` scheme.
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
     if url.startswith("postgresql://"):
         return url.replace("postgresql://", "postgresql+asyncpg://", 1)
     return url

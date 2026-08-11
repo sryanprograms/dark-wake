@@ -1,10 +1,11 @@
-"""Tunable fusion and behavioral thresholds (spec §8–§9). Not used in Phase 0 logic."""
+"""Tunable fusion, behavioral, and replay thresholds (spec §8–§9)."""
 
 from datetime import timedelta
 
 # Fusion (spec §8)
 SAR_MATCH_RADIUS_M = 750
 SAR_MATCH_TIME_WINDOW_S = 600
+SCENE_CLUSTER_WINDOW_S = 1800
 # AIS silence precursors (Tier 0) — not confirmed dark ships; see spec §8.
 GAP_MIN_S = 1800  # 30 min — minimum silence before any live alert
 GAP_HIGH_S = 3600  # 60 min — elevated severity / "suspicious" tier
@@ -27,5 +28,6 @@ REPLAY_WINDOW_PRESETS: dict[str, timedelta] = {
     "3d": timedelta(days=3),
     "7d": timedelta(days=7),
 }
+TIMELINE_HISTORY_DAYS = 30  # scrubber + historical seek limited to this window
 OVERLAP_TIME_MARGIN_S = 86400  # 24 h — Digitraffic timestampExternal is sparse
 OVERLAP_MIN_AIS_POSITIONS = 1

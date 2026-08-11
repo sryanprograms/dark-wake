@@ -80,8 +80,8 @@ def main() -> int:
     parser.add_argument(
         "--source",
         choices=["digitraffic", "dma", "file"],
-        default="digitraffic",
-        help="AIS data source (default: digitraffic for Gulf of Finland)",
+        default="dma",
+        help="AIS data source (default: dma for Danish Belt / western Baltic)",
     )
     parser.add_argument("--start", default=DEFAULT_START, help="ISO start datetime (UTC)")
     parser.add_argument("--end", default=DEFAULT_END, help="ISO end datetime (UTC)")

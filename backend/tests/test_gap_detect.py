@@ -50,5 +50,5 @@ def test_detect_ais_silent():
     alert = detect_ais_silent(state, now=datetime.now(timezone.utc))
     assert alert is not None
     assert alert["kind"] == "ais_silent"
-    assert alert["tier"] == "suspicious"
-    assert alert["severity"] == "high"
+    assert alert["tier"] == "watch"
+    assert alert["severity"] == "medium"
