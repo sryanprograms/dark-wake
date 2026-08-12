@@ -11,6 +11,14 @@ from app.ingest.vessel_meta import country_from_mmsi, flag_from_mmsi, ship_type_
 
 AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
 
+# Class A + Class B position reports and static identity.
+POSITION_MESSAGE_TYPES = (
+    "PositionReport",
+    "StandardClassBPositionReport",
+    "ExtendedClassBPositionReport",
+)
+STATIC_MESSAGE_TYPES = ("ShipStaticData",)
+
 _TIME_UTC_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
 )
@@ -18,9 +26,9 @@ _TIME_UTC_RE = re.compile(
 
 def build_subscription_message(api_key: str) -> dict[str, Any]:
     return {
-        "APIKey": api_key,
+        "APIKey": api_key.strip(),
         "BoundingBoxes": aisstream_bounding_boxes(),
-        "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
+        "FilterMessageTypes": [*POSITION_MESSAGE_TYPES, *STATIC_MESSAGE_TYPES],
     }
 
 
@@ -50,14 +58,20 @@ def _metadata_fields(message: dict[str, Any]) -> dict[str, Any]:
         "flag": flag_from_mmsi(mmsi_int),
         "country": country_from_mmsi(mmsi_int),
         "t": parse_time_utc(meta.get("time_utc")),
+        "latitude": meta.get("latitude"),
+        "longitude": meta.get("longitude"),
     }
 
 
-def parse_position_report(message: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize an AISStream PositionReport envelope to an internal position dict."""
-    if message.get("MessageType") != "PositionReport":
+def _parse_position_payload(
+    message: dict[str, Any],
+    *,
+    message_type: str,
+) -> dict[str, Any] | None:
+    """Normalize a position-report envelope (Class A or Class B) to internal dict."""
+    if message.get("MessageType") != message_type:
         return None
-    report = (message.get("Message") or {}).get("PositionReport")
+    report = (message.get("Message") or {}).get(message_type)
     if not report:
         return None
 
@@ -88,6 +102,11 @@ def parse_position_report(message: dict[str, Any]) -> dict[str, Any] | None:
         "flag": meta.get("flag") or flag_from_mmsi(mmsi_int),
         "country": meta.get("country") or country_from_mmsi(mmsi_int),
     }
+
+
+def parse_position_report(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize an AISStream PositionReport envelope to an internal position dict."""
+    return _parse_position_payload(message, message_type="PositionReport")
 
 
 def parse_ship_static(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -125,8 +144,8 @@ def parse_ship_static(message: dict[str, Any]) -> dict[str, Any] | None:
 def parse_aisstream_message(message: dict[str, Any]) -> dict[str, Any] | None:
     """Return a normalized position or static update, or None if not handled."""
     message_type = message.get("MessageType")
-    if message_type == "PositionReport":
-        return parse_position_report(message)
+    if message_type in POSITION_MESSAGE_TYPES:
+        return _parse_position_payload(message, message_type=message_type)
     if message_type == "ShipStaticData":
         return parse_ship_static(message)
     return None

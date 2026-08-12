@@ -43,12 +43,14 @@ def _cors_origins() -> list[str]:
 async def lifespan(app: FastAPI):
     get_settings.cache_clear()
     settings = get_settings()
-    ingest = get_ais_ingest_service()
-    await ingest.start(settings)
+    # Register hub handlers before starting AIS ingest so the first messages
+    # are not dropped during the startup race.
     timeline_hub = get_timeline_hub()
     await timeline_hub.start(settings)
     live_hub = get_live_hub()
     await live_hub.start(settings)
+    ingest = get_ais_ingest_service()
+    await ingest.start(settings)
     yield
     await timeline_hub.stop()
     await live_hub.stop()

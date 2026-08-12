@@ -65,4 +65,5 @@ async def status(response: Response) -> dict[str, object]:
         "vessel_count": len(hub.registry),
         "sar_detection_count": len(hub._sar_cache),
         "ws_client_count": len(hub.clients),
+        **ingest.diagnostics(),
     }

@@ -29,23 +29,34 @@ class Settings:
     ais_persist_min_interval_s: int
 
 
+def _env(name: str, default: str = "") -> str:
+    """Read env var and strip whitespace/quotes that dashboards sometimes add."""
+    raw = os.getenv(name, default)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings(
-        database_url=os.getenv(
+        database_url=_env(
             "DATABASE_URL",
             "postgresql://darkwake:darkwake@localhost:5432/darkwake",
         ),
-        gfw_api_token=os.getenv("GFW_API_TOKEN", ""),
-        aisstream_api_key=os.getenv("AISSTREAM_API_KEY", ""),
-        digitraffic_user=os.getenv(
+        gfw_api_token=_env("GFW_API_TOKEN"),
+        aisstream_api_key=_env("AISSTREAM_API_KEY"),
+        digitraffic_user=_env(
             "DIGITRAFFIC_USER",
             "DarkWake/Phase0Spike 0.1 (contact: dev@localhost)",
         ),
-        live_track_buffer_hours=float(os.getenv("LIVE_TRACK_BUFFER_HOURS", "6")),
-        sar_poll_interval_s=int(os.getenv("SAR_POLL_INTERVAL_S", "3600")),
-        ais_persist_enabled=os.getenv("AIS_PERSIST_ENABLED", "true").lower()
+        live_track_buffer_hours=float(_env("LIVE_TRACK_BUFFER_HOURS", "6")),
+        sar_poll_interval_s=int(_env("SAR_POLL_INTERVAL_S", "3600")),
+        ais_persist_enabled=_env("AIS_PERSIST_ENABLED", "true").lower()
         in ("1", "true", "yes"),
-        ais_persist_flush_interval_s=int(os.getenv("AIS_PERSIST_FLUSH_INTERVAL_S", "15")),
-        ais_persist_min_interval_s=int(os.getenv("AIS_PERSIST_MIN_INTERVAL_S", "60")),
+        ais_persist_flush_interval_s=int(_env("AIS_PERSIST_FLUSH_INTERVAL_S", "15")),
+        ais_persist_min_interval_s=int(_env("AIS_PERSIST_MIN_INTERVAL_S", "60")),
     )
