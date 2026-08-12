@@ -25,10 +25,12 @@ _TIME_UTC_RE = re.compile(
 
 
 def build_subscription_message(api_key: str) -> dict[str, Any]:
+    # Do not set FilterMessageTypes: some AISStream accounts/keys accept the
+    # socket but deliver nothing when the filter list is present. We filter
+    # client-side in parse_aisstream_message instead.
     return {
         "APIKey": api_key.strip(),
         "BoundingBoxes": aisstream_bounding_boxes(),
-        "FilterMessageTypes": [*POSITION_MESSAGE_TYPES, *STATIC_MESSAGE_TYPES],
     }
 
 

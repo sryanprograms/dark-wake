@@ -92,5 +92,4 @@ def test_build_subscription_message_shape():
     assert msg["APIKey"] == "test-key"
     assert len(msg["BoundingBoxes"]) == 1
     assert len(msg["BoundingBoxes"][0]) == 2
-    assert "StandardClassBPositionReport" in msg["FilterMessageTypes"]
-    assert "PositionReport" in msg["FilterMessageTypes"]
+    assert "FilterMessageTypes" not in msg

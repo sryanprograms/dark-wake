@@ -52,11 +52,9 @@ class LiveHub:
         ingest.on_connected(self._on_ais_connected)
         ingest.on_update(self._handle_update)
 
-        # Gap detection / alert persistence is owned solely by TimelineHub to
-        # avoid duplicate alerts on the shared AIS ingest service.
+        # Gap detection, alert persistence, and SAR sync are owned by
+        # TimelineHub so we don't double-hit GFW (which triggers 429s).
         self._tasks.append(asyncio.create_task(self._track_broadcast_loop()))
-        if self._settings.gfw_api_token:
-            self._tasks.append(asyncio.create_task(self._sar_poll_loop()))
 
     async def _on_ais_connected(self, connected: bool) -> None:
         self.ais_connected = connected

@@ -55,6 +55,17 @@ async def status(response: Response) -> dict[str, object]:
     if not healthy:
         response.status_code = 503
 
+    diag = ingest.diagnostics()
+    # Socket can stay open with a bad/idle subscription; treat "no messages
+    # after a grace period" as not actually live.
+    ais_receiving = bool(
+        diag.get("ais_parsed_updates", 0)
+        or (
+            diag.get("ais_last_raw_age_s") is not None
+            and diag["ais_last_raw_age_s"] < 120
+        )
+    )
+
     return {
         "status": "ok" if healthy else "degraded",
         "version": APP_VERSION,
@@ -62,8 +73,9 @@ async def status(response: Response) -> dict[str, object]:
         "time": datetime.now(timezone.utc).isoformat(),
         "db": db_ok,
         "ais_connected": ingest.ais_connected,
+        "ais_receiving": ais_receiving,
         "vessel_count": len(hub.registry),
         "sar_detection_count": len(hub._sar_cache),
         "ws_client_count": len(hub.clients),
-        **ingest.diagnostics(),
+        **diag,
     }
