@@ -12,6 +12,7 @@ from typing import Any
 
 import certifi
 import websockets
+from websockets.exceptions import InvalidStatus
 
 from app.config.aoi import AOI_NAME
 from app.config.settings import Settings
@@ -22,6 +23,21 @@ logger = logging.getLogger(__name__)
 OnConnected = Callable[[bool], Awaitable[None]]
 OnUpdate = Callable[[dict[str, Any]], Awaitable[None]]
 OnStats = Callable[[dict[str, Any]], None]
+
+_MIN_BACKOFF_S = 10
+_MAX_BACKOFF_S = 600
+_RATE_LIMIT_BACKOFF_S = 120
+
+
+def _retry_delay(exc: BaseException, attempt: int) -> int:
+    """Backoff for reconnects; 429s wait longer so we don't deepen the ban."""
+    if isinstance(exc, InvalidStatus) and getattr(exc, "response", None) is not None:
+        if exc.response.status_code == 429:
+            return min(_RATE_LIMIT_BACKOFF_S * max(1, attempt), _MAX_BACKOFF_S)
+    text = str(exc)
+    if "429" in text:
+        return min(_RATE_LIMIT_BACKOFF_S * max(1, attempt), _MAX_BACKOFF_S)
+    return min(_MIN_BACKOFF_S * (2 ** max(0, attempt - 1)), _MAX_BACKOFF_S)
 
 
 async def run_ais_stream(
@@ -39,12 +55,14 @@ async def run_ais_stream(
 
     subscription = build_subscription_message(api_key)
     ssl_context = ssl.create_default_context(cafile=certifi.where())
+    attempt = 0
 
     while True:
         try:
             async with websockets.connect(AISSTREAM_URL, ssl=ssl_context) as ws:
                 await ws.send(json.dumps(subscription))
                 await on_connected(True)
+                attempt = 0
                 logger.info(
                     "AISStream connected for AOI %s (key_len=%s)",
                     AOI_NAME,
@@ -94,8 +112,14 @@ async def run_ais_stream(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception("AISStream connection failed; retrying in 10s")
+            attempt += 1
+            delay = _retry_delay(exc, attempt)
+            logger.exception(
+                "AISStream connection failed; retrying in %ss (attempt %s)",
+                delay,
+                attempt,
+            )
             if on_stats is not None:
                 on_stats({"error": f"{type(exc).__name__}: {exc}"})
             await on_connected(False)
-            await asyncio.sleep(10)
+            await asyncio.sleep(delay)
